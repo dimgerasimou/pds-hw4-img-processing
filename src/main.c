@@ -7,14 +7,17 @@
  * Department of Electrical and Computer Engineering,
  * Aristotle University of Thessaloniki.
  *
- * Reads an image or a directory of images, processes them, and optionally
- * writes the results. Images are processed in batches to bound memory use;
- * within a batch, every stage (read, decode, encode, write) is parallelized
- * across images with OpenMP. Timings can be written as JSON for
+ * Reads an image or a directory of images, optionally denoises them with
+ * Non-Local Means, and optionally writes the results. Images are processed
+ * in batches to bound memory use; within a batch, every stage is
+ * parallelized with OpenMP, across images or, for the filters, optionally
+ * within each image. Timings can be written as JSON for
  * benchmarking.
  *
  * Usage: ./imgfilter [-o output] [-f format] [-t threads] [-B batch]
- *                    [-b bench.json [-n trials] [-w wtrials]] [-p] <input>
+ *                    [-b bench.json [-n trials] [-w wtrials]] [-p]
+ *                    [-d [-P patch] [-S search] [-H k] [-N sigma] [-A method]
+ *                        [-m mode]] <input>
  */
 
 #include <omp.h>
@@ -40,6 +43,17 @@
 #define DEFAULT_BATCH      256  /* images per batch; bounds peak memory */
 #define DEFAULT_TRIALS     1    /* timed benchmark trials */
 #define DEFAULT_WTRIALS    0    /* warmup benchmark trials */
+
+/*
+ * NLM defaults: Buades et al. (IPOL 2011) recommend 5x5 patches, a 21x21
+ * search window and h = 0.4 sigma for moderate noise (sigma 15-30).
+ */
+#define DEFAULT_NLM_PATCH  2    /* 5x5 patches */
+#define DEFAULT_NLM_SEARCH 10   /* 21x21 search window */
+#define DEFAULT_NLM_H      0.4  /* h = 0.4 * sigma */
+#define DEFAULT_NLM_SIGMA  -1.0 /* estimate per image */
+#define DEFAULT_NLM_METHOD NLM_INTEGRAL
+#define DEFAULT_MODE       PAR_AUTO
 
 /* ------------------------------------------------------------------------- */
 /*                            Static Helper Functions                        */
@@ -73,7 +87,11 @@ run_pipeline(ImageSet *set, size_t batch, int write, Progress *progress)
 		failed += io_run(set, STAGE_READ, first, last, progress);
 		failed += io_run(set, STAGE_DECODE, first, last, progress);
 
-		/* TODO: filters (NLM denoising, Canny edge detection) run here */
+		/* Filters: pixels -> pixels */
+		if (set->denoise.enabled)
+			failed += io_run(set, STAGE_DENOISE, first, last, progress);
+
+		/* TODO: Canny edge detection runs here */
 
 		/* Save images: pixels -> memory -> file */
 		if (write) {
@@ -125,6 +143,15 @@ main(int argc, char *argv[])
 		.trials     = DEFAULT_TRIALS,
 		.wtrials    = DEFAULT_WTRIALS,
 		.progress   = DEFAULT_PROGRESS,
+		.denoise    = 0,
+		.mode       = DEFAULT_MODE,
+		.nlm        = {
+			.patch    = DEFAULT_NLM_PATCH,
+			.search   = DEFAULT_NLM_SEARCH,
+			.h_factor = DEFAULT_NLM_H,
+			.sigma    = DEFAULT_NLM_SIGMA,
+			.method   = DEFAULT_NLM_METHOD,
+		},
 	};
 
 	memset(&set, 0, sizeof(set));
@@ -153,6 +180,11 @@ main(int argc, char *argv[])
 	if (io_resolve(args.input, args.output, args.format, &set))
 		goto cleanup;
 
+	/* Filter configuration */
+	set.denoise.enabled = args.denoise;
+	set.denoise.mode = args.mode;
+	set.denoise.params = args.nlm;
+
 	/* Batch size: 0 means the whole set at once */
 	batch = (args.batch == 0 || args.batch > set.count) ? set.count : args.batch;
 	batches = (set.count + batch - 1) / batch;
@@ -160,13 +192,13 @@ main(int argc, char *argv[])
 	/* Initialize benchmark structure */
 	if (args.bench_path) {
 		bench = benchmark_init(args.input, args.output, args.threads, args.trials,
-		                       args.wtrials, batch, batches, set.count);
+		                       args.wtrials, batch, batches, set.count, &set.denoise);
 		if (!bench)
 			goto cleanup;
 	}
 
 	/* One progress step per image and stage */
-	stages = args.output ? 4 : 2;
+	stages = 2 + (args.denoise ? 1 : 0) + (args.output ? 2 : 0);
 	runs = args.wtrials + args.trials;
 
 	for (unsigned int r = 0; r < runs; r++) {

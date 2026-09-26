@@ -52,6 +52,19 @@ void print_benchmark_info(FILE *f, const BenchmarkInfo *info, const unsigned int
 void print_dataset_info(FILE *f, const DatasetInfo *info, const unsigned int indent_level);
 
 /**
+ * @brief Print the denoising configuration as formatted JSON.
+ *
+ * Outputs `"denoise": null` if the stage is disabled, otherwise its
+ * parameters, parallelization mode, and the noise standard deviations
+ * used (given, or estimated per image).
+ *
+ * @param[in] f            Output stream.
+ * @param[in] info         Pointer to DenoiseInfo structure to print.
+ * @param[in] indent_level Number of spaces to indent the output.
+ */
+void print_denoise_info(FILE *f, const DenoiseInfo *info, const unsigned int indent_level);
+
+/**
  * @brief Print a timing summary as formatted JSON.
  *
  * Outputs `"<name>": { mean, std_dev, median, min, max, total }`.

@@ -17,6 +17,7 @@
 
 #include "error.h"
 #include "io.h"
+#include "nlm.h"
 #include "progress.h"
 
 /**
@@ -31,7 +32,12 @@ enum {
 
 /* Stage names, indexed by STAGE_* */
 static const char *stage_names[STAGE_COUNT] = {
-	"read", "decode", "encode", "write"
+	"read", "decode", "denoise", "encode", "write"
+};
+
+/* Parallelization mode names, indexed by PAR_* */
+static const char *mode_names[PAR_COUNT] = {
+	"auto", "image", "pixel"
 };
 
 /**
@@ -531,6 +537,30 @@ do_decode(ImageItem *it)
 }
 
 /**
+ * @brief Denoise stage for one image: img -> img (replaced).
+ *
+ * @param[in,out] it       Image.
+ * @param[in]     cfg      Denoising configuration.
+ * @param[in]     parallel Non-zero to parallelize within the image.
+ */
+static int
+do_denoise(ImageItem *it, const DenoiseConfig *cfg, int parallel)
+{
+	Image out;
+	int r;
+
+	it->bytes[STAGE_DENOISE] = image_bytes(&it->img);
+
+	r = nlm_denoise(&it->img, &out, &cfg->params, parallel, &it->sigma);
+	if (r != IMG_OK)
+		return r;
+
+	image_free(&it->img);
+	it->img = out;
+	return IMG_OK;
+}
+
+/**
  * @brief Encode stage for one image: img -> buf. Releases img.
  *
  * Encoding is the last use of the pixels, so they are freed right away.
@@ -563,18 +593,53 @@ do_write(ImageItem *it)
 }
 
 /**
+ * @brief Checks whether an image holds valid pixels after the pixel stages.
+ *
+ * Denoising is optional: when it did not run, the decoded pixels are used.
+ */
+static int
+pixels_ok(const ImageSet *set, const ImageItem *it)
+{
+	if (set->denoise.enabled)
+		return it->err[STAGE_DENOISE] == IMG_OK;
+	return it->err[STAGE_DECODE] == IMG_OK;
+}
+
+/**
  * @brief Checks whether an image should take part in a stage.
  */
 static int
-eligible(const ImageItem *it, int stage)
+eligible(const ImageSet *set, const ImageItem *it, int stage)
 {
 	switch (stage) {
-	case STAGE_READ:   return 1;
-	case STAGE_DECODE: return it->err[STAGE_READ] == IMG_OK;
-	case STAGE_ENCODE: return it->out_path && it->err[STAGE_DECODE] == IMG_OK;
-	case STAGE_WRITE:  return it->err[STAGE_ENCODE] == IMG_OK;
-	default:           return 0;
+	case STAGE_READ:    return 1;
+	case STAGE_DECODE:  return it->err[STAGE_READ] == IMG_OK;
+	case STAGE_DENOISE: return set->denoise.enabled && it->err[STAGE_DECODE] == IMG_OK;
+	case STAGE_ENCODE:  return it->out_path && pixels_ok(set, it);
+	case STAGE_WRITE:   return it->err[STAGE_ENCODE] == IMG_OK;
+	default:            return 0;
 	}
+}
+
+/**
+ * @brief Decides whether a stage parallelizes across the images of a range.
+ *
+ * I/O and codec stages always do. Filter stages follow their configured
+ * mode; in auto mode they do when there is at least one image per thread.
+ */
+static int
+across_images(const ImageSet *set, int stage, size_t n)
+{
+	int mode;
+
+	if (stage != STAGE_DENOISE)
+		return 1;
+
+	mode = set->denoise.mode;
+	if (mode == PAR_AUTO)
+		return n >= (size_t)omp_get_max_threads();
+
+	return mode == PAR_IMAGE;
 }
 
 /**
@@ -594,6 +659,10 @@ report_failures(const ImageSet *set, int stage, size_t first, size_t last)
 		case STAGE_READ:
 			uerrf("cannot read \"%s\": %s", it->in_path,
 			      image_strerror(e, it->sys_errno[stage]));
+			break;
+		case STAGE_DENOISE:
+			uerrf("cannot denoise \"%s\": %s", it->in_path,
+			      image_strerror(e, 0));
 			break;
 		case STAGE_DECODE:
 			if (it->detail)
@@ -778,6 +847,7 @@ io_run(ImageSet *set, int stage, size_t first, size_t last, Progress *progress)
 {
 	size_t failed = 0;
 	double t0;
+	int outer;
 
 	if (stage < 0 || stage >= STAGE_COUNT) {
 		DERRF("invalid stage: %d", stage);
@@ -787,15 +857,18 @@ io_run(ImageSet *set, int stage, size_t first, size_t last, Progress *progress)
 	if (last > set->count)
 		last = set->count;
 
+	/* outer: threads over images; otherwise images in turn, threads inside */
+	outer = across_images(set, stage, last - first);
+
 	t0 = omp_get_wtime();
 
-	#pragma omp parallel for schedule(dynamic) reduction(+:failed)
+	#pragma omp parallel for schedule(dynamic) reduction(+:failed) if(outer)
 	for (size_t i = first; i < last; i++) {
 		ImageItem *it = &set->items[i];
 		double ts;
 		int r;
 
-		if (!eligible(it, stage)) {
+		if (!eligible(set, it, stage)) {
 			it->err[stage] = IO_NOT_DONE;
 			progress_tick(progress);
 			continue;
@@ -804,9 +877,10 @@ io_run(ImageSet *set, int stage, size_t first, size_t last, Progress *progress)
 		ts = omp_get_wtime();
 		switch (stage) {
 		case STAGE_READ:   r = do_read(it);                     break;
-		case STAGE_DECODE: r = do_decode(it);                   break;
-		case STAGE_ENCODE: r = do_encode(it, set->out_format);  break;
-		default:           r = do_write(it);                    break;
+		case STAGE_DECODE:  r = do_decode(it);                           break;
+		case STAGE_DENOISE: r = do_denoise(it, &set->denoise, !outer);   break;
+		case STAGE_ENCODE:  r = do_encode(it, set->out_format);          break;
+		default:            r = do_write(it);                            break;
 		}
 		it->time_s[stage] = omp_get_wtime() - ts;
 		it->err[stage] = r;
@@ -870,6 +944,7 @@ io_reset(ImageSet *set)
 
 		it->in_format = IMG_FMT_UNKNOWN;
 		it->width = it->height = 0;
+		it->sigma = 0.0;
 		it->detail = NULL;
 
 		for (int s = 0; s < STAGE_COUNT; s++) {
@@ -884,6 +959,36 @@ io_reset(ImageSet *set)
 		set->performed[s] = 0;
 		set->wall_time_s[s] = 0.0;
 	}
+}
+
+/**
+ * @brief Returns the name of a parallelization mode ("auto", "image", "pixel").
+ *
+ * @param[in] mode PAR_* value.
+ *
+ * @return Static name string.
+ */
+const char*
+io_mode_name(int mode)
+{
+	return (mode >= 0 && mode < PAR_COUNT) ? mode_names[mode] : "unknown";
+}
+
+/**
+ * @brief Parses a parallelization mode name.
+ *
+ * @param[in] name Mode name.
+ *
+ * @return PAR_* value, or -1 if unknown.
+ */
+int
+io_mode_from_name(const char *name)
+{
+	for (int m = 0; m < PAR_COUNT; m++)
+		if (name && strcmp(name, mode_names[m]) == 0)
+			return m;
+
+	return -1;
 }
 
 /**

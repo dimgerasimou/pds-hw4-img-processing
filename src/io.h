@@ -25,11 +25,16 @@
  *
  *   read    file   -> memory   (pure I/O)
  *   decode  memory -> pixels   (pure CPU)
+ *   denoise pixels -> pixels   (optional, NLM)
  *   encode  pixels -> memory   (pure CPU)
  *   write   memory -> file     (pure I/O)
  *
- * so that I/O and (de)compression are timed separately. An image that fails
- * a stage is skipped by all following stages.
+ * so that I/O, (de)compression and filtering are timed separately. An image
+ * that fails a stage is skipped by all following stages.
+ *
+ * The I/O and codec stages always run in parallel across images. Filter
+ * stages can instead run the images one at a time and parallelize within
+ * each image (see the PAR_* modes).
  *
  * To bound memory, the caller runs the stages batch by batch: every stage
  * operates on a range [first, last) of the set, and io_release() frees a
@@ -42,6 +47,7 @@
 #include <stddef.h>
 
 #include "image.h"
+#include "nlm.h"
 #include "progress.h"
 
 /** Marks a stage that was not attempted (distinct from every IMG_* code). */
@@ -58,14 +64,36 @@
 enum {
 	STAGE_READ = 0, /**< Read file contents into memory */
 	STAGE_DECODE,   /**< Decode memory into pixels */
+	STAGE_DENOISE,  /**< NLM denoising of the pixels */
 	STAGE_ENCODE,   /**< Encode pixels into memory */
 	STAGE_WRITE,    /**< Write memory to file */
 	STAGE_COUNT     /**< Sentinel: number of stages */
 };
 
+/**
+ * @enum Parallelization modes
+ * @brief How a filter stage distributes its work over the threads.
+ */
+enum {
+	PAR_AUTO = 0, /**< PAR_IMAGE if the batch has at least one image per thread, else PAR_PIXEL */
+	PAR_IMAGE,    /**< Threads take whole images; each image is filtered serially */
+	PAR_PIXEL,    /**< Images one at a time; threads split the rows of each image */
+	PAR_COUNT     /**< Sentinel: number of modes */
+};
+
 /* ------------------------------------------------------------------------- */
 /*                              Data Structures                              */
 /* ------------------------------------------------------------------------- */
+
+/**
+ * @struct DenoiseConfig
+ * @brief Configuration of the denoising stage.
+ */
+typedef struct {
+	int enabled;      /**< Non-zero to run the stage */
+	int mode;         /**< Parallelization mode (PAR_*) */
+	NlmParams params; /**< Filter parameters */
+} DenoiseConfig;
 
 /**
  * @struct ImageItem
@@ -80,6 +108,7 @@ typedef struct {
 	Image img;                     /**< Decoded pixels */
 	unsigned int width;            /**< Width after decode (kept after release) */
 	unsigned int height;           /**< Height after decode (kept after release) */
+	double sigma;                  /**< Noise standard deviation used by denoise */
 	int err[STAGE_COUNT];          /**< IMG_* result per stage, or IO_NOT_DONE */
 	int sys_errno[STAGE_COUNT];    /**< errno per stage for IMG_ERR_SYS */
 	const char *detail;            /**< Decoder message on decode failure, or NULL */
@@ -96,6 +125,7 @@ typedef struct {
 	size_t count;                   /**< Number of images */
 	int out_format;                 /**< Output format (IMG_FMT_*) */
 	int quiet;                      /**< Non-zero to not report failures */
+	DenoiseConfig denoise;          /**< Denoising stage configuration */
 	int performed[STAGE_COUNT];     /**< 1 if the stage ran */
 	double wall_time_s[STAGE_COUNT];/**< Elapsed time of each stage, summed over batches */
 } ImageSet;
@@ -128,8 +158,11 @@ int io_resolve(const char *input, const char *output, int format, ImageSet *set)
 /**
  * @brief Runs one stage over the eligible images of a range, in parallel.
  *
- * An image is eligible if it passed the previous stage (and, for encode and
- * write, has an output path). Failures are reported after the parallel
+ * An image is eligible if it passed the previous stage that ran (and, for
+ * encode and write, has an output path). The denoise stage runs only if
+ * enabled in the set, with the parallelization mode of its configuration;
+ * all other stages run in parallel across images. Failures are reported
+ * after the parallel
  * region, in input order, unless set->quiet is set. The wall time of the
  * call is added to the stage's total in the set.
  *
@@ -137,7 +170,8 @@ int io_resolve(const char *input, const char *output, int format, ImageSet *set)
  * not, so a bar sized as (images x stages run) always reaches 100%.
  *
  * Data volume recorded per image: bytes read (read), pixel bytes produced
- * (decode), pixel bytes consumed (encode), bytes written (write).
+ * (decode), pixel bytes filtered (denoise), pixel bytes consumed (encode),
+ * bytes written (write).
  *
  * Buffers are released as soon as they are no longer needed: file contents
  * after decode, pixels after encode, encoded data after write.
@@ -173,6 +207,24 @@ void io_release(ImageSet *set, size_t first, size_t last);
  * @param[in,out] set Image set.
  */
 void io_reset(ImageSet *set);
+
+/**
+ * @brief Returns the name of a parallelization mode ("auto", "image", "pixel").
+ *
+ * @param[in] mode PAR_* value.
+ *
+ * @return Static name string.
+ */
+const char* io_mode_name(int mode);
+
+/**
+ * @brief Parses a parallelization mode name.
+ *
+ * @param[in] name Mode name.
+ *
+ * @return PAR_* value, or -1 if unknown.
+ */
+int io_mode_from_name(const char *name);
 
 /**
  * @brief Returns the short name of a stage ("read", "decode", ...).

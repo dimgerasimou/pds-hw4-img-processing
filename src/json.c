@@ -161,6 +161,50 @@ print_dataset_info(FILE *f, const DatasetInfo *info, const unsigned int indent_l
 }
 
 /**
+ * @brief Print the denoising configuration as formatted JSON.
+ *
+ * Outputs `"denoise": null` if the stage is disabled, otherwise its
+ * parameters, parallelization mode, and the noise standard deviations
+ * used (given, or estimated per image).
+ *
+ * @param[in] f            Output stream.
+ * @param[in] info         Pointer to DenoiseInfo structure to print.
+ * @param[in] indent_level Number of spaces to indent the output.
+ */
+void
+print_denoise_info(FILE *f, const DenoiseInfo *info, const unsigned int indent_level)
+{
+	const DenoiseConfig *c = &info->config;
+
+	fprintf(f, "%*s\"denoise\": ", indent_level, "");
+
+	if (!c->enabled) {
+		fputs("null", f);
+		return;
+	}
+
+	fprintf(f, "{\n");
+	fprintf(f, "%*s\"algorithm\": \"nlm\",\n", indent_level + 2, "");
+	fprintf(f, "%*s\"method\": ", indent_level + 2, "");
+	json_print_escaped(f, nlm_method_name(c->params.method));
+	fprintf(f, ",\n");
+	fprintf(f, "%*s\"mode\": ", indent_level + 2, "");
+	json_print_escaped(f, io_mode_name(c->mode));
+	fprintf(f, ",\n");
+	fprintf(f, "%*s\"patch_radius\": %u,\n", indent_level + 2, "", c->params.patch);
+	fprintf(f, "%*s\"search_radius\": %u,\n", indent_level + 2, "", c->params.search);
+	fprintf(f, "%*s\"h_factor\": %.4f,\n", indent_level + 2, "", c->params.h_factor);
+	fprintf(f, "%*s\"sigma\": ", indent_level + 2, "");
+	if (c->params.sigma >= 0.0)
+		fprintf(f, "%.4f,\n", c->params.sigma);
+	else
+		fputs("\"estimated\",\n", f);
+	fprintf(f, "%*s\"sigma_used\": { \"mean\": %.4f, \"min\": %.4f, \"max\": %.4f }\n",
+	        indent_level + 2, "", info->sigma_mean, info->sigma_min, info->sigma_max);
+	fprintf(f, "%*s}", indent_level, "");
+}
+
+/**
  * @brief Print a timing summary as formatted JSON.
  *
  * Outputs `"<name>": { mean, std_dev, median, min, max, total }`.

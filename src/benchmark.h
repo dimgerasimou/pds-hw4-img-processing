@@ -75,6 +75,17 @@ typedef struct {
 } SystemInfo;
 
 /**
+ * @struct DenoiseInfo
+ * @brief Configuration of the denoising stage and the noise levels used.
+ */
+typedef struct {
+	DenoiseConfig config; /**< Stage configuration */
+	double sigma_mean;    /**< Mean noise standard deviation used */
+	double sigma_min;     /**< Smallest noise standard deviation used */
+	double sigma_max;     /**< Largest noise standard deviation used */
+} DenoiseInfo;
+
+/**
  * @struct BenchmarkInfo
  * @brief Benchmark execution parameters.
  */
@@ -129,6 +140,7 @@ typedef struct {
 	SystemInfo sys_info;              /**< System information */
 	BenchmarkInfo benchmark_info;     /**< Benchmark parameters */
 	DatasetInfo dataset_info;         /**< Image set information */
+	DenoiseInfo denoise_info;         /**< Denoising configuration and noise */
 	StageResult results[STAGE_COUNT]; /**< Per-stage results */
 	Statistics pipeline_time;         /**< Whole-pipeline time over trials */
 	MemoryInfo memory;                /**< Memory usage */
@@ -173,13 +185,15 @@ double now_sec(void);
  * @param[in] batch   Images per batch.
  * @param[in] batches Number of batches per trial.
  * @param[in] images  Number of images in the set.
+ * @param[in] denoise Denoising stage configuration.
  *
  * @return Pointer to a newly allocated Benchmark structure, or NULL on failure.
  */
 Benchmark* benchmark_init(const char *input, const char *output,
                           const unsigned int threads, const unsigned int trials,
                           const unsigned int wtrials, const size_t batch,
-                          const size_t batches, const size_t images);
+                          const size_t batches, const size_t images,
+                          const DenoiseConfig *denoise);
 
 /**
  * @brief Frees a Benchmark structure. Safe to call with NULL.

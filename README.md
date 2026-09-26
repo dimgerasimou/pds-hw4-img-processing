@@ -11,8 +11,8 @@ Assignment #4 of the **Parallel and Distributed Systems** coursework: [parallel-
 **Canny edge detection** on multicore CPUs (**OpenMP**) and **single NVIDIA GPUs** (**CUDA**), with a strong
 emphasis on comparing parallelization strategies and reproducible benchmarking.
 
-> **Status:** the I/O pipeline, benchmarking and progress reporting are implemented.
-> The filters (NLM, Canny) and the CUDA backend are in progress.
+> **Status:** the I/O pipeline, benchmarking, and NLM denoising with OpenMP are implemented.
+> Canny edge detection and the CUDA backend are in progress.
 
 ## Overview
 
@@ -39,8 +39,9 @@ impractical.
 - Thread-safe **progress bars** for every stage
 - Automated benchmarking with **JSON output**: system information, dataset information, and per-stage
   wall time, throughput and per-image statistics
+- **Non-Local Means denoising** with OpenMP, parallelized either across images or within each image
 - Planned:
-  - **NLM denoising** — sequential, OpenMP and CUDA
+  - **NLM denoising** — CUDA
   - **Canny edge detection** — sequential, OpenMP and CUDA
 
 ## Build
@@ -77,6 +78,7 @@ Run `make help` for all targets and overrides.
 | `-n <n>`      | Timed benchmark trials (default: 1, requires `-b`)      |
 | `-w <n>`      | Warmup benchmark trials (default: 0, requires `-b`)     |
 | `-p`          | Show progress bars (on stderr)                          |
+| `-d`          | Denoise with Non-Local Means (see below)                |
 | `-h`          | Show help                                               |
 
 Input and output follow the conventions of `cp`:
@@ -117,6 +119,84 @@ Examples:
 
 # benchmark reading only, JSON to stdout
 ./bin/imgfilter -b - data/ | jq .results.read
+```
+
+## Denoising
+
+`-d` enables **Non-Local Means** denoising, following Buades, Coll and Morel, *Non-Local Means Denoising*,
+Image Processing On Line 1 (2011). Every pixel is replaced by a weighted average of the pixels in a search
+window around it, weighted by how similar the patches around them are:
+
+```
+d²(p,q) = mean squared difference of the patches around p and q
+w(p,q)  = exp( −max(d² − 2σ², 0) / h² ),   h = k·σ
+out(p)  = Σ w(p,q)·I(q) / Σ w(p,q)
+```
+
+Two noisy copies of the same patch differ by 2σ² on average, which is subtracted so that identical
+structure gets full weight. The pixel itself is weighted like its most similar neighbor.
+
+| Option      | Parameter                          | Default                  | Effect |
+| ----------- | ---------------------------------- | ------------------------ | ------ |
+| `-P <r>`    | patch radius, patches (2r+1)²      | 2 (5×5)                  | larger: more robust similarity under strong noise, less fine detail |
+| `-S <r>`    | search radius, window (2r+1)²      | 10 (21×21)               | larger: more candidates, stronger denoising |
+| `-H <k>`    | strength, h = k·σ                  | 0.4                      | larger: smoother; smaller: more noise kept |
+| `-N <σ>`    | noise standard deviation           | estimated per image      | scale of h and of the 2σ² offset |
+| `-A <name>` | method: `integral` or `direct`     | `integral`               | performance only; the output is identical |
+| `-m <mode>` | parallelization (see below)        | `auto`                   | performance only; the output is identical |
+
+The defaults are the paper's recommendation for moderate noise. When `-N` is not given, σ is estimated
+for every image with Immerkær's method (*Fast Noise Variance Estimation*, 1996), using integer sums so the
+estimate does not depend on the thread count. The estimate reads low on images with large saturated
+areas (e.g. pure black backgrounds), where clipping has removed part of the noise; use `-N` there.
+
+**Methods** (`-A`). Both produce bit-for-bit identical output:
+
+- `direct` compares every pair of patches pixel by pixel: (2S+1)²·(2P+1)² operations per pixel
+  (11,025 with the defaults). A comparison stops as soon as its partial sum shows the weight will be
+  negligible, which skips most of the work on images with little noise.
+- `integral` (default) exchanges the loops: for every offset of the search window, the squared
+  differences between the image and its shifted copy are accumulated into an integral image
+  (summed-area table), from which any patch sum is read with 4 lookups. The cost is about (2S+1)² per
+  pixel, independent of the patch size (Darbon et al., ISBI 2008). The image is processed in bands of
+  about 32 rows so that each band's integral image and accumulators stay in the L2 cache; 32-bit
+  integral values are allowed to wrap, since patch sums are exact modulo 2³².
+
+In both, a weight depends only on the integer patch sum, so the weights of all possible sums are
+computed once per image into a table instead of calling `expf()` for every candidate; the table holds
+exactly the values `expf()` would return.
+
+Single-thread times, 512×512 crop of a chest X-ray, defaults (P=2, S=10):
+
+| Input                  | direct (original) | direct | integral |
+| ---------------------- | ----------------: | -----: | -------: |
+| clean X-ray (σ ≈ 0.8)  | 2.10 s            | 0.98 s | 0.17 s   |
+| noise σ = 10 added     | 3.32 s            | 2.08 s | 0.34 s   |
+| noise σ = 40 added     | 3.47 s            | 2.31 s | 0.42 s   |
+
+The integral method is 5–12× faster than the optimized direct method and 10–19× faster than the
+original. On clean images, rejected candidates are skipped with a well-predicted branch; a branch-free
+loop would be faster on very noisy images but slower on clean ones.
+
+**Parallelization** (`-m`):
+
+| Mode    | Work distribution                                                         |
+| ------- | ------------------------------------------------------------------------- |
+| `image` | threads take whole images of the batch; each image is filtered serially  |
+| `pixel` | images are filtered one at a time; the threads split each image's rows   |
+| `auto`  | `image` when the batch holds at least one image per thread, else `pixel` |
+
+`pixel` is the only mode that speeds up a single image (rows for `direct`, bands for `integral`);
+`image` avoids synchronization inside the filter but depends on having enough images, of similar size,
+per batch. The output is identical for
+every mode and thread count; `-t 1` is the serial baseline.
+
+```bash
+# denoise a directory
+./bin/imgfilter -d -o clean/ noisy/
+
+# stronger smoothing, known noise level, one image on all threads
+./bin/imgfilter -d -H 0.6 -N 20 -m pixel -o clean.pgm noisy.png
 ```
 
 ## Batch Processing
@@ -178,6 +258,8 @@ document is written containing:
 - `benchmark_info` — timestamp, threads, trials, warmup trials, batch size and number of batches
 - `dataset_info` — input/output paths, output format, number of images per input format, total pixels,
   range of dimensions
+- `denoise` — `null`, or the NLM parameters, parallelization mode, and the noise levels σ used
+  (mean / min / max over the images)
 - `results` — for each stage: images processed and failed, data volume, throughput, and two timing
   summaries (mean / median / standard deviation / min / max / total): `wall_time`, the stage's elapsed
   time over the trials, and `per_image`, the individual image times over all trials; `null` for stages
@@ -189,6 +271,7 @@ document is written containing:
 | -------- | -------------------------- | ------------------------ |
 | `read`   | file → memory (pure I/O)   | bytes read               |
 | `decode` | memory → pixels (CPU)      | pixel bytes produced     |
+| `denoise`| pixels → pixels (CPU)      | pixel bytes filtered     |
 | `encode` | pixels → memory (CPU)      | pixel bytes consumed     |
 | `write`  | memory → file (pure I/O)   | bytes written            |
 
@@ -217,7 +300,16 @@ tools/bench.sh -t "1 2 4 8 16" -B "16 64 256 1024" -f pgm data/xrays
 
 # cold cache: page cache dropped (sudo) before every run
 tools/bench.sh -c cold -n 3 -t "8 16" data/xrays
+
+# denoising: both parallelization modes over thread counts, with filter parameters
+tools/bench.sh -d -m "image pixel" -t "1 2 4 8 16" -x "-P 2 -S 7" data/xrays_subset
+
+# denoising: both methods on one image, speedup over one thread
+tools/bench.sh -d -a "direct integral" -m pixel -t "1 2 4 8 16" image.jpeg
 ```
+
+When thread count 1 is part of a sweep, the summary shows each run's speedup over the 1-thread run of
+the same configuration (denoise stage time if it ran, otherwise pipeline time).
 
 Threads are bound to physical cores first (`OMP_PROC_BIND=close`, `OMP_PLACES=cores`); beyond one
 thread per core they share cores through hyperthreading. Images are written to a scratch directory
@@ -231,7 +323,8 @@ src/
 ├── main.c          Entry point: argument handling and pipeline stages
 ├── args.[ch]       Command-line parsing
 ├── io.[ch]         Input/output resolution and parallel loading/saving
-├── image.[ch]      Image container and PGM reading/writing
+├── image.[ch]      Image container and codecs
+├── nlm.[ch]        Non-Local Means denoising and noise estimation
 ├── progress.[ch]   Thread-safe progress bar
 ├── benchmark.[ch]  Timing, statistics and system information
 ├── json.[ch]       JSON output
@@ -241,7 +334,7 @@ src/
     ├── stb_image.h
     └── stb_image_write.h
 tools/
-└── bench.sh        Benchmark sweeps over threads and batch sizes
+└── bench.sh        Benchmark sweeps over threads, batch sizes and modes
 ```
 
 ## Third-Party Code

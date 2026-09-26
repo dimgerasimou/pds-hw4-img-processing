@@ -207,6 +207,31 @@ getdatasetinfo(Benchmark *b, const ImageSet *set)
 }
 
 /**
+ * @brief Records the noise levels used by the denoising stage.
+ */
+static void
+getdenoiseinfo(Benchmark *b, const ImageSet *set)
+{
+	DenoiseInfo *d = &b->denoise_info;
+	double sum = 0.0;
+	size_t n = 0;
+
+	for (size_t i = 0; i < set->count; i++) {
+		const ImageItem *it = &set->items[i];
+
+		if (it->err[STAGE_DENOISE] != IMG_OK)
+			continue;
+
+		if (n == 0 || it->sigma < d->sigma_min) d->sigma_min = it->sigma;
+		if (n == 0 || it->sigma > d->sigma_max) d->sigma_max = it->sigma;
+		sum += it->sigma;
+		n++;
+	}
+
+	d->sigma_mean = n ? sum / n : 0.0;
+}
+
+/**
  * @brief Summarizes the recorded samples into the result structures.
  */
 static void
@@ -275,13 +300,15 @@ now_sec(void)
  * @param[in] batch   Images per batch.
  * @param[in] batches Number of batches per trial.
  * @param[in] images  Number of images in the set.
+ * @param[in] denoise Denoising stage configuration.
  *
  * @return Pointer to a newly allocated Benchmark structure, or NULL on failure.
  */
 Benchmark*
 benchmark_init(const char *input, const char *output, const unsigned int threads,
                const unsigned int trials, const unsigned int wtrials,
-               const size_t batch, const size_t batches, const size_t images)
+               const size_t batch, const size_t batches, const size_t images,
+               const DenoiseConfig *denoise)
 {
 	Benchmark *b;
 
@@ -317,6 +344,8 @@ benchmark_init(const char *input, const char *output, const unsigned int threads
 	b->benchmark_info.wtrials = wtrials;
 	b->benchmark_info.batch_size = batch;
 	b->benchmark_info.batches = batches;
+	if (denoise)
+		b->denoise_info.config = *denoise;
 	gettimestamp(b);
 	getcpuinfo(b);
 	getmeminfo(b);
@@ -431,8 +460,10 @@ benchmark_trial_end(Benchmark *b, const ImageSet *set)
 		r->data_mib = bytes / 1024.0 / 1024.0;
 	}
 
-	if (t == 0)
+	if (t == 0) {
 		getdatasetinfo(b, set);
+		getdenoiseinfo(b, set);
+	}
 
 	return 0;
 }
@@ -481,6 +512,8 @@ benchmark_write(Benchmark *b, const char *path)
 	print_benchmark_info(f, &b->benchmark_info, JSON_INDENT);
 	fprintf(f, ",\n");
 	print_dataset_info(f, &b->dataset_info, JSON_INDENT);
+	fprintf(f, ",\n");
+	print_denoise_info(f, &b->denoise_info, JSON_INDENT);
 	fprintf(f, ",\n");
 	fprintf(f, "%*s\"results\": {\n", JSON_INDENT, "");
 	for (int s = 0; s < STAGE_COUNT; s++) {

@@ -11,6 +11,8 @@
 #ifndef ARGS_H
 #define ARGS_H
 
+#include "nlm.h"
+
 /* ------------------------------------------------------------------------- */
 /*                              Data Structures                              */
 /* ------------------------------------------------------------------------- */
@@ -32,6 +34,9 @@ typedef struct {
 	unsigned int trials;  /**< Timed benchmark trials (-n, requires -b) */
 	unsigned int wtrials; /**< Warmup benchmark trials (-w, requires -b) */
 	int progress;         /**< Non-zero to show progress bars (-p) */
+	int denoise;          /**< Non-zero to run NLM denoising (-d) */
+	int mode;             /**< Filter parallelization mode (-m), PAR_* */
+	NlmParams nlm;        /**< NLM parameters (-P, -S, -H, -N, -A) */
 } Args;
 
 /* ------------------------------------------------------------------------- */
@@ -53,6 +58,13 @@ typedef struct {
  *   -n <trials>   Timed benchmark trials (must be > 0, requires -b)
  *   -w <wtrials>  Warmup benchmark trials (requires -b)
  *   -p            Show progress bars
+ *   -d            Denoise with Non-Local Means
+ *   -P <radius>   NLM patch radius
+ *   -S <radius>   NLM search radius
+ *   -H <k>        NLM strength, h = k * sigma
+ *   -N <sigma>    NLM noise standard deviation (default: estimated per image)
+ *   -A <method>   NLM method: integral or direct
+ *   -m <mode>     Filter parallelization: auto, image or pixel
  *   -h            Show usage and exit
  *
  * Required argument:

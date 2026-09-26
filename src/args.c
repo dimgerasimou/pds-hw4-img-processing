@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -23,6 +24,11 @@
 #include "args.h"
 #include "error.h"
 #include "image.h"
+#include "io.h"
+
+/* Largest accepted NLM radii; beyond these the cost explodes for no gain */
+#define MAX_PATCH_RADIUS  10
+#define MAX_SEARCH_RADIUS 50
 
 /* ------------------------------------------------------------------------- */
 /*                            Static Helper Functions                        */
@@ -55,6 +61,18 @@ usage(void)
 		"  -w <wtrials>       Warmup benchmark trials  (default: 0, needs -b)\n"
 		"  -p                 Show progress bars\n"
 		"  -h                 Show this help message and exit\n\n"
+		"Denoising (Non-Local Means):\n"
+		"  -d                 Enable denoising\n"
+		"  -P <radius>        Patch radius, patches are (2r+1)^2   (default: 2)\n"
+		"  -S <radius>        Search radius, window is (2r+1)^2    (default: 10)\n"
+		"  -H <k>             Strength, h = k * sigma              (default: 0.4)\n"
+		"  -N <sigma>         Noise standard deviation (default: estimated per image)\n"
+		"  -A <method>        Patch distances: integral or direct (default: integral)\n"
+		"                       same output; integral cost does not grow with -P\n"
+		"  -m <mode>          Parallelization of the filter     (default: auto)\n"
+		"                       image  threads over images, each filtered serially\n"
+		"                       pixel  images in turn, threads over the rows\n"
+		"                       auto   image if a batch has an image per thread\n\n"
 		"Arguments:\n"
 		"  input              Image or directory of images\n"
 		"                     (PGM, PNG, JPEG, BMP, TGA; converted to grayscale)\n\n"
@@ -66,8 +84,9 @@ usage(void)
 		"  no -o              Process only, nothing is written\n\n"
 		"Examples:\n"
 		"  %s -t 8 -o out/ data/\n"
-		"  %s -p -b results.json -f png -o out/ data/\n",
-		program_name, program_name, program_name
+		"  %s -p -b results.json -f png -o out/ data/\n"
+		"  %s -d -P 3 -S 7 -m pixel -o clean.pgm noisy.png\n",
+		program_name, program_name, program_name, program_name
 	);
 
 	free(program_name);
@@ -103,6 +122,34 @@ parse_uint(const char *s, unsigned int *out)
 		return 0;
 
 	*out = (unsigned int)v;
+	return 1;
+}
+
+/**
+ * @brief Parse a finite, non-negative double with full validation.
+ *
+ * Rejects signs, trailing garbage, overflow, NaN and infinity.
+ *
+ * @param[in]  s   Input string.
+ * @param[out] out Output value.
+ * @return 1 on success, 0 on failure.
+ */
+static int
+parse_udouble(const char *s, double *out)
+{
+	char *end = NULL;
+	double v;
+
+	if (!s || !*s || *s == '-' || *s == '+')
+		return 0;
+
+	errno = 0;
+	v = strtod(s, &end);
+
+	if (errno != 0 || end == s || *end != '\0' || !isfinite(v) || v < 0.0)
+		return 0;
+
+	*out = v;
 	return 1;
 }
 
@@ -150,6 +197,13 @@ bad_opt(int opt, int is_missing_arg)
  *   -n <trials>   Timed benchmark trials (must be > 0, requires -b)
  *   -w <wtrials>  Warmup benchmark trials (requires -b)
  *   -p            Show progress bars
+ *   -d            Denoise with Non-Local Means
+ *   -P <radius>   NLM patch radius
+ *   -S <radius>   NLM search radius
+ *   -H <k>        NLM strength, h = k * sigma
+ *   -N <sigma>    NLM noise standard deviation (default: estimated per image)
+ *   -A <method>   NLM method: integral or direct
+ *   -m <mode>     Filter parallelization: auto, image or pixel
  *   -h            Show usage and exit
  *
  * Required argument:
@@ -164,7 +218,7 @@ bad_opt(int opt, int is_missing_arg)
 int
 parse_args(int argc, char *argv[], Args *args)
 {
-	int opt, repeat = 0;
+	int opt, repeat = 0, nlm_opt = 0;
 
 	if (!args) {
 		DERRF("args is NULL");
@@ -173,7 +227,7 @@ parse_args(int argc, char *argv[], Args *args)
 
 	opterr = 0;
 
-	while ((opt = getopt(argc, argv, "o:f:t:B:b:n:w:ph")) != -1) {
+	while ((opt = getopt(argc, argv, "o:f:t:B:b:n:w:pdP:S:H:N:A:m:h")) != -1) {
 		switch (opt) {
 		case 'o':
 			args->output = optarg;
@@ -242,6 +296,80 @@ parse_args(int argc, char *argv[], Args *args)
 			args->progress = 1;
 			break;
 
+		case 'd':
+			args->denoise = 1;
+			break;
+
+		case 'P': {
+			unsigned int v;
+			if (!parse_uint(optarg, &v))
+				return bad_num('P');
+			if (v > MAX_PATCH_RADIUS) {
+				uerrf("patch radius must be at most %d", MAX_PATCH_RADIUS);
+				usage();
+				return 1;
+			}
+			args->nlm.patch = v;
+			nlm_opt = 1;
+			break;
+		}
+
+		case 'S': {
+			unsigned int v;
+			if (!parse_uint(optarg, &v))
+				return bad_num('S');
+			if (v == 0 || v > MAX_SEARCH_RADIUS) {
+				uerrf("search radius must be between 1 and %d", MAX_SEARCH_RADIUS);
+				usage();
+				return 1;
+			}
+			args->nlm.search = v;
+			nlm_opt = 1;
+			break;
+		}
+
+		case 'H': {
+			double v;
+			if (!parse_udouble(optarg, &v) || v == 0.0)
+				return bad_num('H');
+			args->nlm.h_factor = v;
+			nlm_opt = 1;
+			break;
+		}
+
+		case 'N': {
+			double v;
+			if (!parse_udouble(optarg, &v))
+				return bad_num('N');
+			args->nlm.sigma = v;
+			nlm_opt = 1;
+			break;
+		}
+
+		case 'A': {
+			int m = nlm_method_from_name(optarg);
+			if (m < 0) {
+				uerrf("unknown method '%s' (use integral or direct)", optarg);
+				usage();
+				return 1;
+			}
+			args->nlm.method = m;
+			nlm_opt = 1;
+			break;
+		}
+
+		case 'm': {
+			int m = io_mode_from_name(optarg);
+			if (m < 0) {
+				uerrf("unknown mode '%s' (use auto, image or pixel)", optarg);
+				usage();
+				return 1;
+			}
+			args->mode = m;
+			nlm_opt = 1;
+			break;
+		}
+
 		case 'h':
 			usage();
 			return -1;
@@ -249,10 +377,19 @@ parse_args(int argc, char *argv[], Args *args)
 		case '?':
 		default:
 			if (optopt == 'o' || optopt == 'f' || optopt == 't' || optopt == 'B'
-			    || optopt == 'b' || optopt == 'n' || optopt == 'w')
+			    || optopt == 'b' || optopt == 'n' || optopt == 'w' || optopt == 'P'
+			    || optopt == 'S' || optopt == 'H' || optopt == 'N' || optopt == 'A'
+			    || optopt == 'm')
 				return bad_opt(optopt, 1);
 			return bad_opt(optopt ? optopt : '?', 0);
 		}
+	}
+
+	/* Filter options without the filter are almost certainly a mistake */
+	if (nlm_opt && !args->denoise) {
+		uerrf("-P, -S, -H, -N, -A and -m require -d");
+		usage();
+		return 1;
 	}
 
 	/* Repeating the work only makes sense when it is being measured */
