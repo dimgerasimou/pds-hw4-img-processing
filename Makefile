@@ -14,7 +14,7 @@ CFLAGS   ?= -Wall -Wextra -Wpedantic -O3 -fopenmp
 LDFLAGS  ?= -fopenmp
 LDLIBS   ?= -lm
 
-# Vendored third-party code (stb)
+# Vendored third-party code (stb): optimized, but not held to our warnings
 EXT_CFLAGS ?= -O3 -w
 
 # Add include paths
@@ -32,12 +32,14 @@ OBJS     := $(C_OBJS) $(EXT_OBJS)
 
 TARGET ?= $(BIN_DIR)/$(PROJECT)
 
+# The generated .d files contain rules; without this, the first of them
+# would become the default goal and a plain `make` would stop relinking.
 .DEFAULT_GOAL := all
 
 DEPS := $(OBJS:.o=.d)
 -include $(DEPS)
 
-# ---------- Pretty output ----------
+# ---------- Pretty output (optional colors) ----------
 PRINTF ?= printf
 ifeq ($(NO_COLOR),1)
   COLOR_RESET   :=
@@ -98,4 +100,4 @@ help:
 	@$(PRINTF) "  make CC=clang\n"
 	@$(PRINTF) "  make NO_COLOR=1\n\n"
 	@$(PRINTF) "$(COLOR_BOLD)Usage:$(COLOR_RESET)\n"
-	@$(PRINTF) "  ./$(TARGET) [-o output] [-f format] [-t threads] [-b bench.json] [-p] <input>\n\n"
+	@$(PRINTF) "  ./$(TARGET) [-o output] [-f format] [-t threads] [-B batch] [-b bench.json [-n trials] [-w wtrials]] [-p] <input>\n\n"

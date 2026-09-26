@@ -8,15 +8,18 @@
  * Aristotle University of Thessaloniki.
  *
  * Reads an image or a directory of images, processes them, and optionally
- * writes the results. Every stage (read, decode, encode, write) is
- * parallelized across images with OpenMP. Timings can be written as JSON
- * for benchmarking.
+ * writes the results. Images are processed in batches to bound memory use;
+ * within a batch, every stage (read, decode, encode, write) is parallelized
+ * across images with OpenMP. Timings can be written as JSON for
+ * benchmarking.
  *
- * Usage: ./imgfilter [-o output] [-f format] [-t threads] [-b bench.json] [-p] <input>
+ * Usage: ./imgfilter [-o output] [-f format] [-t threads] [-B batch]
+ *                    [-b bench.json [-n trials] [-w wtrials]] [-p] <input>
  */
 
 #include <omp.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "args.h"
@@ -24,6 +27,7 @@
 #include "error.h"
 #include "image.h"
 #include "io.h"
+#include "progress.h"
 
 /* ------------------------------------------------------------------------- */
 /*                              Default Values                               */
@@ -33,6 +37,55 @@
 #define DEFAULT_BENCH_PATH NULL /* no benchmark output */
 #define DEFAULT_FORMAT     IMG_FMT_UNKNOWN /* automatic, see io_resolve() */
 #define DEFAULT_PROGRESS   0
+#define DEFAULT_BATCH      256  /* images per batch; bounds peak memory */
+#define DEFAULT_TRIALS     1    /* timed benchmark trials */
+#define DEFAULT_WTRIALS    0    /* warmup benchmark trials */
+
+/* ------------------------------------------------------------------------- */
+/*                            Static Helper Functions                        */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * @brief Runs the whole pipeline once over the image set, batch by batch.
+ *
+ * Each batch goes through every stage, each stage parallel over the batch,
+ * and is then released, so that at most @p batch images are in memory.
+ *
+ * @param[in,out] set      Image set (reset by the caller).
+ * @param[in]     batch    Images per batch.
+ * @param[in]     write    Non-zero to encode and write the results.
+ * @param[in,out] progress Progress bar, one step per image and stage.
+ *
+ * @return Number of stage failures.
+ */
+static size_t
+run_pipeline(ImageSet *set, size_t batch, int write, Progress *progress)
+{
+	size_t failed = 0;
+
+	for (size_t first = 0; first < set->count; first += batch) {
+		size_t last = first + batch;
+
+		if (last > set->count)
+			last = set->count;
+
+		/* Load images: file -> memory -> pixels */
+		failed += io_run(set, STAGE_READ, first, last, progress);
+		failed += io_run(set, STAGE_DECODE, first, last, progress);
+
+		/* TODO: filters (NLM denoising, Canny edge detection) run here */
+
+		/* Save images: pixels -> memory -> file */
+		if (write) {
+			failed += io_run(set, STAGE_ENCODE, first, last, progress);
+			failed += io_run(set, STAGE_WRITE, first, last, progress);
+		}
+
+		io_release(set, first, last);
+	}
+
+	return failed;
+}
 
 /* ------------------------------------------------------------------------- */
 /*                                Main Function                              */
@@ -41,9 +94,10 @@
 /**
  * @brief Program entry point.
  *
- * Parses command-line arguments, resolves the input and output paths,
- * loads and decodes the images, encodes and writes them back if requested,
- * and records timings.
+ * Parses command-line arguments, resolves the input and output paths, and
+ * runs the pipeline. When benchmarking, the pipeline runs wtrials times
+ * unrecorded, then trials times recorded, and the statistics are written
+ * as JSON.
  *
  * @param[in] argc Argument count.
  * @param[in] argv Argument vector.
@@ -55,8 +109,10 @@ main(int argc, char *argv[])
 {
 	ImageSet set;
 	Benchmark *bench = NULL;
-	size_t failed = 0;
-	int ret = 1;
+	Progress progress;
+	size_t failed = 0, batch, batches;
+	unsigned int runs;
+	int stages, ret = 1;
 
 	/* Command-line arguments with defaults */
 	Args args = {
@@ -65,6 +121,9 @@ main(int argc, char *argv[])
 		.bench_path = DEFAULT_BENCH_PATH,
 		.format     = DEFAULT_FORMAT,
 		.threads    = (unsigned int)omp_get_max_threads(),
+		.batch      = DEFAULT_BATCH,
+		.trials     = DEFAULT_TRIALS,
+		.wtrials    = DEFAULT_WTRIALS,
 		.progress   = DEFAULT_PROGRESS,
 	};
 
@@ -94,32 +153,59 @@ main(int argc, char *argv[])
 	if (io_resolve(args.input, args.output, args.format, &set))
 		goto cleanup;
 
+	/* Batch size: 0 means the whole set at once */
+	batch = (args.batch == 0 || args.batch > set.count) ? set.count : args.batch;
+	batches = (set.count + batch - 1) / batch;
+
 	/* Initialize benchmark structure */
 	if (args.bench_path) {
-		bench = benchmark_init(args.input, args.output, args.threads);
+		bench = benchmark_init(args.input, args.output, args.threads, args.trials,
+		                       args.wtrials, batch, batches, set.count);
 		if (!bench)
 			goto cleanup;
 	}
 
-	/* Load images: file -> memory -> pixels */
-	failed += io_run(&set, STAGE_READ, args.progress);
-	failed += io_run(&set, STAGE_DECODE, args.progress);
+	/* One progress step per image and stage */
+	stages = args.output ? 4 : 2;
+	runs = args.wtrials + args.trials;
 
-	/* TODO: filters (NLM denoising, Canny edge detection) run here */
+	for (unsigned int r = 0; r < runs; r++) {
+		int timed = (r >= args.wtrials);
+		const char *label = "run";
+		char note[32] = "";
+		size_t run_failed;
 
-	/* Save images: pixels -> memory -> file */
-	if (args.output) {
-		failed += io_run(&set, STAGE_ENCODE, args.progress);
-		failed += io_run(&set, STAGE_WRITE, args.progress);
+		if (runs > 1) {
+			label = timed ? "trial" : "warmup";
+			snprintf(note, sizeof(note), "%u/%u",
+			         timed ? r - args.wtrials + 1 : r + 1,
+			         timed ? args.trials : args.wtrials);
+		}
+
+		io_reset(&set);
+		set.quiet = (r > 0); /* failures repeat every run: report them once */
+
+		progress_init(&progress, label, set.count * (size_t)stages,
+		              (size_t)stages, args.progress);
+		progress_set(&progress, NULL, note);
+
+		if (bench && timed)
+			benchmark_trial_start(bench);
+
+		run_failed = run_pipeline(&set, batch, args.output != NULL, &progress);
+
+		if (bench && timed && benchmark_trial_end(bench, &set))
+			goto cleanup;
+
+		progress_finish(&progress);
+
+		if (r == 0)
+			failed = run_failed;
 	}
 
 	/* Write benchmark results in JSON format */
-	if (bench) {
-		if (benchmark_collect(bench, &set))
-			goto cleanup;
-		if (benchmark_write(bench, args.bench_path))
-			goto cleanup;
-	}
+	if (bench && benchmark_write(bench, args.bench_path))
+		goto cleanup;
 
 	/* Success only if every image made it through */
 	ret = failed ? 1 : 0;

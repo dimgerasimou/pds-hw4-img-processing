@@ -34,6 +34,7 @@ impractical.
 - Reads **PGM, PNG, JPEG, BMP and TGA** (converted to 8-bit grayscale); writes **PGM or PNG**
 - Pipeline split into **read → decode → encode → write** stages, each parallelized across images with
   OpenMP and timed separately, so file I/O and (de)compression are never mixed in one measurement
+- **Batch processing** with bounded memory: peak usage depends on the batch size, not the dataset size
 - Configurable thread count
 - Thread-safe **progress bars** for every stage
 - Automated benchmarking with **JSON output**: system information, dataset information, and per-stage
@@ -71,7 +72,10 @@ Run `make help` for all targets and overrides.
 | `-o <output>` | Output file or directory (nothing is written if omitted) |
 | `-f <format>` | Output format: `pgm` or `png` (see below)               |
 | `-t <n>`      | Number of threads (default: all cores)                  |
+| `-B <n>`      | Images per batch, `0` for all at once (default: 256)    |
 | `-b <file>`   | Write benchmark results as JSON (`-` for stdout)        |
+| `-n <n>`      | Timed benchmark trials (default: 1, requires `-b`)      |
+| `-w <n>`      | Warmup benchmark trials (default: 0, requires `-b`)     |
 | `-p`          | Show progress bars (on stderr)                          |
 | `-h`          | Show help                                               |
 
@@ -115,6 +119,36 @@ Examples:
 ./bin/imgfilter -b - data/ | jq .results.read
 ```
 
+## Batch Processing
+
+Images are processed in batches of `-B` images. Each batch passes through every stage, each stage
+parallel over the batch, and is then released:
+
+```
+for each batch of B images:
+    read → decode → [filters] → encode → write      (each stage: parallel over the batch)
+    free the batch
+```
+
+Within a batch, every buffer is also freed as soon as it is no longer needed: the file contents after
+decoding, the pixels after encoding, the encoded data after writing.
+
+Peak memory therefore scales with `B`. For 400 images of 1024×1024 (400 MiB of pixels):
+
+| `-B` | Batches | Peak RSS |
+| ---: | ------: | -------: |
+| 0 (all) | 1 | 465 MiB |
+| 128 | 4 | 183 MiB |
+| 32 | 13 | 59 MiB |
+| 8 | 50 | 22 MiB |
+
+Output is identical for every batch size and thread count. Each stage ends with a synchronization point
+per batch, where threads wait for the slowest image; with `B` much larger than the thread count this cost
+is negligible.
+
+With `-p`, a progress bar shows each run of the pipeline (and, when benchmarking, each warmup and
+timed trial).
+
 ## Image Formats
 
 | Format | Read | Write | Implementation |
@@ -136,14 +170,20 @@ supported, so no dynamic range is lost) or PNG first.
 
 ## Benchmarking
 
-With `-b`, a JSON document is written containing:
+### Single configuration
+
+With `-b`, the pipeline runs `-w` warmup trials (not recorded), then `-n` timed trials, and a JSON
+document is written containing:
 - `sys_info` — CPU model, logical cores, RAM and swap
-- `benchmark_info` — timestamp and thread count
+- `benchmark_info` — timestamp, threads, trials, warmup trials, batch size and number of batches
 - `dataset_info` — input/output paths, output format, number of images per input format, total pixels,
   range of dimensions
-- `results` — for each stage: images processed and failed, data volume, wall time, throughput, and
-  per-image mean / median / standard deviation / min / max; `null` for stages that did not run
-- `cpu_peak_rss_gb` — peak memory usage of the process
+- `results` — for each stage: images processed and failed, data volume, throughput, and two timing
+  summaries (mean / median / standard deviation / min / max / total): `wall_time`, the stage's elapsed
+  time over the trials, and `per_image`, the individual image times over all trials; `null` for stages
+  that did not run
+- `pipeline_time` — elapsed time of the whole pipeline over the trials
+- `memory` — peak resident memory, and major/minor page faults during the timed trials
 
 | Stage    | Work                       | Data volume (`data_mib`) |
 | -------- | -------------------------- | ------------------------ |
@@ -152,9 +192,37 @@ With `-b`, a JSON document is written containing:
 | `encode` | pixels → memory (CPU)      | pixel bytes consumed     |
 | `write`  | memory → file (pure I/O)   | bytes written            |
 
-For a stage, `wall_time_s` is the elapsed time of the whole parallel stage, while
-`per_image.total_time_s` is the sum of the individual image times; their ratio is the effective
-parallelism achieved.
+Throughput uses the median wall time. `per_image.total_time_s` divided by the total wall time of the
+trials shows how many threads were busy on average; it is not a speedup, which needs a single-thread
+run for reference.
+
+A non-zero `major_page_faults` means pages had to be read back from disk (e.g. swap) during the timed
+trials, and the timings are not representative.
+
+Reading is dominated by the page cache: a dataset read once is served from memory afterwards. State
+the cache condition of every measurement; use `-w 1` for warm-cache results, or the cold mode of the
+sweep script below.
+
+### Sweeps
+
+`tools/bench.sh` runs one `imgfilter` process per configuration and collects the JSON files, with a
+record of the environment, in a results directory:
+
+```bash
+# threads 1..nproc, default batch size, warm cache, no output
+tools/bench.sh data/xrays
+
+# threads x batch sizes, writing PGM
+tools/bench.sh -t "1 2 4 8 16" -B "16 64 256 1024" -f pgm data/xrays
+
+# cold cache: page cache dropped (sudo) before every run
+tools/bench.sh -c cold -n 3 -t "8 16" data/xrays
+```
+
+Threads are bound to physical cores first (`OMP_PROC_BIND=close`, `OMP_PLACES=cores`); beyond one
+thread per core they share cores through hyperthreading. Images are written to a scratch directory
+inside the results directory, never to `/tmp`, which is often RAM-backed. Run `tools/bench.sh -h` for
+all options.
 
 ## Project Structure
 
@@ -172,6 +240,8 @@ src/
     ├── stb.c           Compilation unit for the stb libraries
     ├── stb_image.h
     └── stb_image_write.h
+tools/
+└── bench.sh        Benchmark sweeps over threads and batch sizes
 ```
 
 ## Third-Party Code

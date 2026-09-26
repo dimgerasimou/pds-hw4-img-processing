@@ -40,6 +40,8 @@ cmp_double(const void *a, const void *b)
 /**
  * @brief Calculates statistics over an array of times.
  *
+ * The same summary is used for per-image times and for per-trial times.
+ *
  * Sorts @p times in place.
  *
  * @param[in,out] times Array of times in seconds.
@@ -117,8 +119,8 @@ getcpuinfo(Benchmark *b)
 		if (strncmp(line, "model name", 10) == 0) {
 			char *p = strchr(line, ':');
 			if (p) {
-				snprintf(b->sys_info.cpu_info, sizeof(b->sys_info.cpu_info), "%s", p + 2);
-				b->sys_info.cpu_info[strcspn(b->sys_info.cpu_info, "\n")] = 0;
+				snprintf(b->sys_info.cpu_info, sizeof(b->sys_info.cpu_info), "%s", p + 2); // skip ": "
+				b->sys_info.cpu_info[strcspn(b->sys_info.cpu_info, "\n")] = 0;             // remove newline
 			}
 			break;
 		}
@@ -148,15 +150,90 @@ getpeakrss(Benchmark *b)
 {
 	struct rusage ru;
 
-	/* ru_maxrss is reported in kib */
+	/* ru_maxrss is reported in kilobytes on Linux */
 	if (getrusage(RUSAGE_SELF, &ru) == 0)
-		b->cpu_peak_rss_gb = (double)ru.ru_maxrss / 1024.0 / 1024.0;
+		b->memory.cpu_peak_rss_gb = (double)ru.ru_maxrss / 1024.0 / 1024.0;
 	else
-		b->cpu_peak_rss_gb = 0.0;
+		b->memory.cpu_peak_rss_gb = 0.0;
 }
 
 /**
- * @brief Copies a string into a fixed buffer, always NULL-terminating.
+ * @brief Reads the process-wide page fault counters (all threads).
+ */
+static void
+getfaults(long *major, long *minor)
+{
+	struct rusage ru;
+
+	if (getrusage(RUSAGE_SELF, &ru) == 0) {
+		*major = ru.ru_majflt;
+		*minor = ru.ru_minflt;
+	} else {
+		*major = *minor = 0;
+	}
+}
+
+/**
+ * @brief Records the dataset information from the image set.
+ */
+static void
+getdatasetinfo(Benchmark *b, const ImageSet *set)
+{
+	DatasetInfo *d = &b->dataset_info;
+	int first = 1;
+
+	d->images = set->count;
+	d->output_format = set->out_format;
+	d->pixels = 0;
+	memset(d->formats, 0, sizeof(d->formats));
+
+	for (size_t i = 0; i < set->count; i++) {
+		const ImageItem *it = &set->items[i];
+
+		if (it->err[STAGE_DECODE] != IMG_OK)
+			continue;
+
+		if (it->in_format >= 0 && it->in_format < IMG_FMT_COUNT)
+			d->formats[it->in_format]++;
+
+		d->pixels += (unsigned long long)it->width * it->height;
+
+		if (first || it->width < d->min_width)   d->min_width = it->width;
+		if (first || it->height < d->min_height) d->min_height = it->height;
+		if (first || it->width > d->max_width)   d->max_width = it->width;
+		if (first || it->height > d->max_height) d->max_height = it->height;
+		first = 0;
+	}
+}
+
+/**
+ * @brief Summarizes the recorded samples into the result structures.
+ */
+static void
+summarize(Benchmark *b)
+{
+	unsigned int n = b->trials_done;
+
+	for (int s = 0; s < STAGE_COUNT; s++) {
+		StageResult *r = &b->results[s];
+		double median;
+
+		if (!r->performed)
+			continue;
+
+		calcstatistics(b->wall[s], n, &r->wall_time);
+		calcstatistics(b->samples[s], b->nsamples[s], &r->per_image);
+
+		median = r->wall_time.median_time_s;
+		r->throughput_mib_s = median > 0.0 ? r->data_mib / median : 0.0;
+		r->images_per_sec = median > 0.0 ? r->images / median : 0.0;
+	}
+
+	calcstatistics(b->pipeline, n, &b->pipeline_time);
+}
+
+/**
+ * @brief Copies a string into a fixed buffer, always NUL-terminating.
  */
 static void
 copy_str(char *dst, size_t n, const char *src)
@@ -171,6 +248,9 @@ copy_str(char *dst, size_t n, const char *src)
 /**
  * @brief Returns current monotonic time in seconds.
  *
+ * Uses CLOCK_MONOTONIC for reliable timing measurements that are not
+ * affected by system clock adjustments.
+ *
  * @return Current time in seconds (floating point).
  */
 double
@@ -184,33 +264,69 @@ now_sec(void)
 /**
  * @brief Initializes a benchmark structure.
  *
- * Allocates a new Benchmark, records the run parameters and a timestamp,
- * and captures system information.
+ * Allocates a new Benchmark and its sample buffers, records the run
+ * parameters and a timestamp, and captures system information.
  *
  * @param[in] input   Input path.
  * @param[in] output  Output path, or NULL if nothing is written.
  * @param[in] threads Number of OpenMP threads.
+ * @param[in] trials  Number of timed trials (> 0).
+ * @param[in] wtrials Number of warmup trials.
+ * @param[in] batch   Images per batch.
+ * @param[in] batches Number of batches per trial.
+ * @param[in] images  Number of images in the set.
  *
  * @return Pointer to a newly allocated Benchmark structure, or NULL on failure.
  */
 Benchmark*
-benchmark_init(const char *input, const char *output, const unsigned int threads)
+benchmark_init(const char *input, const char *output, const unsigned int threads,
+               const unsigned int trials, const unsigned int wtrials,
+               const size_t batch, const size_t batches, const size_t images)
 {
-	Benchmark *b = calloc(1, sizeof(Benchmark));
+	Benchmark *b;
+
+	if (trials == 0) {
+		DERRF("trials must be > 0");
+		return NULL;
+	}
+
+	b = calloc(1, sizeof(Benchmark));
 	if (!b) {
 		DERRNOF("calloc() failed");
 		return NULL;
 	}
 
+	b->images = images;
+
+	for (int s = 0; s < STAGE_COUNT; s++) {
+		b->wall[s] = calloc(trials, sizeof(double));
+		b->samples[s] = calloc((size_t)trials * (images ? images : 1), sizeof(double));
+		if (!b->wall[s] || !b->samples[s])
+			goto fail;
+	}
+
+	b->pipeline = calloc(trials, sizeof(double));
+	if (!b->pipeline)
+		goto fail;
+
 	copy_str(b->dataset_info.input_path, sizeof(b->dataset_info.input_path), input);
 	copy_str(b->dataset_info.output_path, sizeof(b->dataset_info.output_path), output);
 
 	b->benchmark_info.threads = threads;
+	b->benchmark_info.trials = trials;
+	b->benchmark_info.wtrials = wtrials;
+	b->benchmark_info.batch_size = batch;
+	b->benchmark_info.batches = batches;
 	gettimestamp(b);
 	getcpuinfo(b);
 	getmeminfo(b);
 
 	return b;
+
+fail:
+	DERRNOF("calloc() failed");
+	benchmark_free(b);
+	return NULL;
 }
 
 /**
@@ -221,47 +337,78 @@ benchmark_init(const char *input, const char *output, const unsigned int threads
 void
 benchmark_free(Benchmark *b)
 {
+	if (!b)
+		return;
+
+	for (int s = 0; s < STAGE_COUNT; s++) {
+		free(b->wall[s]);
+		free(b->samples[s]);
+	}
+	free(b->pipeline);
 	free(b);
 }
 
 /**
- * @brief Records the results of all stages that ran.
+ * @brief Marks the start of a timed trial.
  *
- * Computes per-image statistics from the timings stored in the image set
- * and fills the dataset information. Call once, after the last stage.
+ * Records the start time and the page fault counters.
+ *
+ * @param[in,out] b Benchmark structure.
+ */
+void
+benchmark_trial_start(Benchmark *b)
+{
+	getfaults(&b->majflt_start, &b->minflt_start);
+	b->trial_start = now_sec();
+}
+
+/**
+ * @brief Records a finished timed trial.
+ *
+ * Stores the stage wall times and per-image times from the image set, the
+ * whole-pipeline time since benchmark_trial_start(), and the page faults.
+ * The first call also fills the dataset information.
  *
  * @param[in,out] b   Benchmark structure.
- * @param[in]     set Image set after the stages ran.
+ * @param[in]     set Image set after the trial.
  *
  * @return 0 on success, 1 on error.
  */
 int
-benchmark_collect(Benchmark *b, const ImageSet *set)
+benchmark_trial_end(Benchmark *b, const ImageSet *set)
 {
-	DatasetInfo *d;
-	double *times;
-	int first = 1;
+	double elapsed;
+	unsigned int t;
+	long major, minor;
 
 	if (!b || !set) {
 		DERRF("benchmark or image set not initialized");
 		return 1;
 	}
 
-	times = malloc((set->count ? set->count : 1) * sizeof(double));
-	if (!times) {
-		DERRNOF("malloc() failed");
+	elapsed = now_sec() - b->trial_start;
+
+	if (b->trials_done >= b->benchmark_info.trials || set->count > b->images) {
+		DERRF("more trials or images than allocated");
 		return 1;
 	}
+
+	getfaults(&major, &minor);
+	b->memory.major_page_faults += major - b->majflt_start;
+	b->memory.minor_page_faults += minor - b->minflt_start;
+
+	t = b->trials_done++;
+	b->pipeline[t] = elapsed;
 
 	for (int s = 0; s < STAGE_COUNT; s++) {
 		StageResult *r = &b->results[s];
 		double bytes = 0.0;
-		size_t n = 0, failed = 0;
-
-		memset(r, 0, sizeof(*r));
+		size_t ok = 0, failed = 0;
 
 		if (!set->performed[s])
 			continue;
+
+		b->wall[s][t] = set->wall_time_s[s];
 
 		for (size_t i = 0; i < set->count; i++) {
 			const ImageItem *it = &set->items[i];
@@ -273,46 +420,19 @@ benchmark_collect(Benchmark *b, const ImageSet *set)
 				continue;
 			}
 
-			times[n++] = it->time_s[s];
+			b->samples[s][b->nsamples[s]++] = it->time_s[s];
 			bytes += (double)it->bytes[s];
+			ok++;
 		}
 
 		r->performed = 1;
-		r->images = n;
+		r->images = ok;
 		r->failed = failed;
 		r->data_mib = bytes / 1024.0 / 1024.0;
-		r->wall_time_s = set->wall_time_s[s];
-		r->throughput_mib_s = r->wall_time_s > 0.0 ? r->data_mib / r->wall_time_s : 0.0;
-		r->images_per_sec = r->wall_time_s > 0.0 ? n / r->wall_time_s : 0.0;
-		calcstatistics(times, n, &r->per_image);
 	}
 
-	free(times);
-
-	d = &b->dataset_info;
-	d->images = set->count;
-	d->output_format = set->out_format;
-	d->pixels = 0;
-	memset(d->formats, 0, sizeof(d->formats));
-
-	for (size_t i = 0; i < set->count; i++) {
-		const ImageItem *it = &set->items[i];
-		const Image *img = &it->img;
-
-		if (it->err[STAGE_DECODE] != IMG_OK)
-			continue;
-
-		if (it->in_format >= 0 && it->in_format < IMG_FMT_COUNT)
-			d->formats[it->in_format]++;
-
-		d->pixels += (unsigned long long)img->width * img->height;
-
-		if (first || img->width < d->min_width)   d->min_width = img->width;
-		if (first || img->height < d->min_height) d->min_height = img->height;
-		if (first || img->width > d->max_width)   d->max_width = img->width;
-		if (first || img->height > d->max_height) d->max_height = img->height;
-		first = 0;
-	}
+	if (t == 0)
+		getdatasetinfo(b, set);
 
 	return 0;
 }
@@ -320,10 +440,11 @@ benchmark_collect(Benchmark *b, const ImageSet *set)
 /**
  * @brief Writes benchmark results as JSON.
  *
- * Captures the peak memory usage and writes system information, benchmark
- * parameters, dataset information and stage results.
+ * Summarizes the recorded trials, captures the peak memory usage, and
+ * writes system information, benchmark parameters, dataset information,
+ * stage results, pipeline time and memory usage.
  *
- * @param[in,out] b    Benchmark structure with populated data.
+ * @param[in,out] b    Benchmark structure with recorded trials.
  * @param[in]     path Output file path, or "-" for stdout.
  *
  * @return 0 on success, 1 on error (already reported).
@@ -339,6 +460,12 @@ benchmark_write(Benchmark *b, const char *path)
 		return 1;
 	}
 
+	if (b->trials_done == 0) {
+		DERRF("no trials recorded");
+		return 1;
+	}
+
+	summarize(b);
 	getpeakrss(b);
 
 	to_stdout = (strcmp(path, "-") == 0);
@@ -361,8 +488,10 @@ benchmark_write(Benchmark *b, const char *path)
 		fprintf(f, s + 1 < STAGE_COUNT ? ",\n" : "\n");
 	}
 	fprintf(f, "%*s},\n", JSON_INDENT, "");
-	fprintf(f, "%*s\"cpu_peak_rss_gb\": %.4f\n", JSON_INDENT, "", b->cpu_peak_rss_gb);
-	fprintf(f, "}\n");
+	print_statistics(f, "pipeline_time", &b->pipeline_time, JSON_INDENT);
+	fprintf(f, ",\n");
+	print_memory_info(f, &b->memory, JSON_INDENT);
+	fprintf(f, "\n}\n");
 
 	if (to_stdout) {
 		if (fflush(f) != 0) {

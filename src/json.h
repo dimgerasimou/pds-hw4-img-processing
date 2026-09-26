@@ -29,7 +29,8 @@ void print_sys_info(FILE *f, const SystemInfo *info, const unsigned int indent_l
 /**
  * @brief Print benchmark parameters as formatted JSON.
  *
- * Outputs a JSON object containing the timestamp and the thread count.
+ * Outputs a JSON object containing the timestamp, the thread count, the
+ * number of timed and warmup trials, and the batching parameters.
  *
  * @param[in] f            Output stream.
  * @param[in] info         Pointer to BenchmarkInfo structure to print.
@@ -51,11 +52,24 @@ void print_benchmark_info(FILE *f, const BenchmarkInfo *info, const unsigned int
 void print_dataset_info(FILE *f, const DatasetInfo *info, const unsigned int indent_level);
 
 /**
+ * @brief Print a timing summary as formatted JSON.
+ *
+ * Outputs `"<name>": { mean, std_dev, median, min, max, total }`.
+ *
+ * @param[in] f            Output stream.
+ * @param[in] name         JSON key.
+ * @param[in] s            Pointer to Statistics structure to print.
+ * @param[in] indent_level Number of spaces to indent the output.
+ */
+void print_statistics(FILE *f, const char *name, const Statistics *s,
+                      const unsigned int indent_level);
+
+/**
  * @brief Print the result of one stage as formatted JSON.
  *
- * Outputs `"<name>": { ... }` with counts, data volume, wall time,
- * throughput and per-image statistics, or `"<name>": null` if the stage
- * did not run.
+ * Outputs `"<name>": { ... }` with counts, data volume, throughput, and
+ * the wall time and per-image time summaries, or `"<name>": null` if the
+ * stage did not run.
  *
  * @param[in] f            Output stream.
  * @param[in] name         JSON key of the stage.
@@ -64,5 +78,17 @@ void print_dataset_info(FILE *f, const DatasetInfo *info, const unsigned int ind
  */
 void print_stage_result(FILE *f, const char *name, const StageResult *r,
                         const unsigned int indent_level);
+
+/**
+ * @brief Print memory usage as formatted JSON.
+ *
+ * Outputs a JSON object containing the peak resident set size and the
+ * major and minor page faults of the timed trials.
+ *
+ * @param[in] f            Output stream.
+ * @param[in] info         Pointer to MemoryInfo structure to print.
+ * @param[in] indent_level Number of spaces to indent the output.
+ */
+void print_memory_info(FILE *f, const MemoryInfo *info, const unsigned int indent_level);
 
 #endif /* JSON_H */

@@ -524,18 +524,26 @@ do_decode(ImageItem *it)
 	it->buf = NULL;
 	it->buf_len = 0;
 
+	it->width = it->img.width;
+	it->height = it->img.height;
 	it->bytes[STAGE_DECODE] = image_bytes(&it->img);
 	return r;
 }
 
 /**
- * @brief Encode stage for one image: img -> buf.
+ * @brief Encode stage for one image: img -> buf. Releases img.
+ *
+ * Encoding is the last use of the pixels, so they are freed right away.
  */
 static int
 do_encode(ImageItem *it, int fmt)
 {
+	int r;
+
 	it->bytes[STAGE_ENCODE] = image_bytes(&it->img);
-	return image_encode(&it->img, fmt, &it->buf, &it->buf_len);
+	r = image_encode(&it->img, fmt, &it->buf, &it->buf_len);
+	image_free(&it->img);
+	return r;
 }
 
 /**
@@ -570,12 +578,12 @@ eligible(const ImageItem *it, int stage)
 }
 
 /**
- * @brief Reports the failures of a stage, in input order.
+ * @brief Reports the failures of a stage within a range, in input order.
  */
 static void
-report_failures(const ImageSet *set, int stage)
+report_failures(const ImageSet *set, int stage, size_t first, size_t last)
 {
-	for (size_t i = 0; i < set->count; i++) {
+	for (size_t i = first; i < last; i++) {
 		const ImageItem *it = &set->items[i];
 		int e = it->err[stage];
 
@@ -741,26 +749,34 @@ fail_quiet:
 }
 
 /**
- * @brief Runs one stage over every eligible image in parallel.
+ * @brief Runs one stage over the eligible images of a range, in parallel.
  *
  * An image is eligible if it passed the previous stage (and, for encode and
  * write, has an output path). Failures are reported after the parallel
- * region, in input order. The wall time of the stage is stored in the set.
+ * region, in input order, unless set->quiet is set. The wall time of the
+ * call is added to the stage's total in the set.
+ *
+ * Every image of the range advances @p progress by one step, eligible or
+ * not, so a bar sized as (images x stages run) always reaches 100%.
  *
  * Data volume recorded per image: bytes read (read), pixel bytes produced
  * (decode), pixel bytes consumed (encode), bytes written (write).
  *
+ * Buffers are released as soon as they are no longer needed: file contents
+ * after decode, pixels after encode, encoded data after write.
+ *
  * @param[in,out] set      Image set.
  * @param[in]     stage    STAGE_* value.
- * @param[in]     progress Non-zero to show a progress bar.
+ * @param[in]     first    First image of the range.
+ * @param[in]     last     One past the last image of the range.
+ * @param[in,out] progress Progress bar to advance (may be disabled).
  *
  * @return Number of images that failed this stage.
  */
 size_t
-io_run(ImageSet *set, int stage, int progress)
+io_run(ImageSet *set, int stage, size_t first, size_t last, Progress *progress)
 {
-	Progress p;
-	size_t failed = 0, todo = 0;
+	size_t failed = 0;
 	double t0;
 
 	if (stage < 0 || stage >= STAGE_COUNT) {
@@ -768,21 +784,20 @@ io_run(ImageSet *set, int stage, int progress)
 		return 0;
 	}
 
-	for (size_t i = 0; i < set->count; i++)
-		if (eligible(&set->items[i], stage))
-			todo++;
+	if (last > set->count)
+		last = set->count;
 
-	progress_init(&p, stage_names[stage], todo, progress);
 	t0 = omp_get_wtime();
 
 	#pragma omp parallel for schedule(dynamic) reduction(+:failed)
-	for (size_t i = 0; i < set->count; i++) {
+	for (size_t i = first; i < last; i++) {
 		ImageItem *it = &set->items[i];
 		double ts;
 		int r;
 
 		if (!eligible(it, stage)) {
 			it->err[stage] = IO_NOT_DONE;
+			progress_tick(progress);
 			continue;
 		}
 
@@ -799,16 +814,76 @@ io_run(ImageSet *set, int stage, int progress)
 		if (r != IMG_OK)
 			failed++;
 
-		progress_tick(&p);
+		progress_tick(progress);
 	}
 
-	set->wall_time_s[stage] = omp_get_wtime() - t0;
+	set->wall_time_s[stage] += omp_get_wtime() - t0;
 	set->performed[stage] = 1;
 
-	progress_finish(&p);
-	report_failures(set, stage);
+	/* move the bar out of the way so the messages get their own lines */
+	if (failed && !set->quiet) {
+		progress_clear(progress);
+		report_failures(set, stage, first, last);
+	}
 
 	return failed;
+}
+
+/**
+ * @brief Frees the buffers of a range of images.
+ *
+ * Paths, per-stage results and dimensions are kept for benchmarking.
+ *
+ * @param[in,out] set   Image set.
+ * @param[in]     first First image of the range.
+ * @param[in]     last  One past the last image of the range.
+ */
+void
+io_release(ImageSet *set, size_t first, size_t last)
+{
+	if (last > set->count)
+		last = set->count;
+
+	for (size_t i = first; i < last; i++) {
+		free(set->items[i].buf);
+		set->items[i].buf = NULL;
+		set->items[i].buf_len = 0;
+		image_free(&set->items[i].img);
+	}
+}
+
+/**
+ * @brief Clears all per-run state, keeping paths and the output format.
+ *
+ * Call before running the stages again on the same set (e.g. repeated
+ * benchmark trials). Releases any remaining buffers.
+ *
+ * @param[in,out] set Image set.
+ */
+void
+io_reset(ImageSet *set)
+{
+	io_release(set, 0, set->count);
+
+	for (size_t i = 0; i < set->count; i++) {
+		ImageItem *it = &set->items[i];
+
+		it->in_format = IMG_FMT_UNKNOWN;
+		it->width = it->height = 0;
+		it->detail = NULL;
+
+		for (int s = 0; s < STAGE_COUNT; s++) {
+			it->err[s] = IO_NOT_DONE;
+			it->sys_errno[s] = 0;
+			it->time_s[s] = 0.0;
+			it->bytes[s] = 0;
+		}
+	}
+
+	for (int s = 0; s < STAGE_COUNT; s++) {
+		set->performed[s] = 0;
+		set->wall_time_s[s] = 0.0;
+	}
 }
 
 /**

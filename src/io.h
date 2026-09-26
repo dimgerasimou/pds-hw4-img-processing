@@ -30,6 +30,10 @@
  *
  * so that I/O and (de)compression are timed separately. An image that fails
  * a stage is skipped by all following stages.
+ *
+ * To bound memory, the caller runs the stages batch by batch: every stage
+ * operates on a range [first, last) of the set, and io_release() frees a
+ * finished batch. Stage wall times accumulate over all batches.
  */
 
 #ifndef IO_H
@@ -38,6 +42,7 @@
 #include <stddef.h>
 
 #include "image.h"
+#include "progress.h"
 
 /** Marks a stage that was not attempted (distinct from every IMG_* code). */
 #define IO_NOT_DONE (-1)
@@ -73,6 +78,8 @@ typedef struct {
 	unsigned char *buf;            /**< Encoded bytes: file contents or encoder output */
 	size_t buf_len;                /**< Size of buf in bytes */
 	Image img;                     /**< Decoded pixels */
+	unsigned int width;            /**< Width after decode (kept after release) */
+	unsigned int height;           /**< Height after decode (kept after release) */
 	int err[STAGE_COUNT];          /**< IMG_* result per stage, or IO_NOT_DONE */
 	int sys_errno[STAGE_COUNT];    /**< errno per stage for IMG_ERR_SYS */
 	const char *detail;            /**< Decoder message on decode failure, or NULL */
@@ -88,8 +95,9 @@ typedef struct {
 	ImageItem *items;               /**< Array of images */
 	size_t count;                   /**< Number of images */
 	int out_format;                 /**< Output format (IMG_FMT_*) */
+	int quiet;                      /**< Non-zero to not report failures */
 	int performed[STAGE_COUNT];     /**< 1 if the stage ran */
-	double wall_time_s[STAGE_COUNT];/**< Elapsed time of each stage in seconds */
+	double wall_time_s[STAGE_COUNT];/**< Elapsed time of each stage, summed over batches */
 } ImageSet;
 
 /* ------------------------------------------------------------------------- */
@@ -118,22 +126,53 @@ typedef struct {
 int io_resolve(const char *input, const char *output, int format, ImageSet *set);
 
 /**
- * @brief Runs one stage over every eligible image in parallel.
+ * @brief Runs one stage over the eligible images of a range, in parallel.
  *
  * An image is eligible if it passed the previous stage (and, for encode and
  * write, has an output path). Failures are reported after the parallel
- * region, in input order. The wall time of the stage is stored in the set.
+ * region, in input order, unless set->quiet is set. The wall time of the
+ * call is added to the stage's total in the set.
+ *
+ * Every image of the range advances @p progress by one step, eligible or
+ * not, so a bar sized as (images x stages run) always reaches 100%.
  *
  * Data volume recorded per image: bytes read (read), pixel bytes produced
  * (decode), pixel bytes consumed (encode), bytes written (write).
  *
+ * Buffers are released as soon as they are no longer needed: file contents
+ * after decode, pixels after encode, encoded data after write.
+ *
  * @param[in,out] set      Image set.
  * @param[in]     stage    STAGE_* value.
- * @param[in]     progress Non-zero to show a progress bar.
+ * @param[in]     first    First image of the range.
+ * @param[in]     last     One past the last image of the range.
+ * @param[in,out] progress Progress bar to advance (may be disabled).
  *
  * @return Number of images that failed this stage.
  */
-size_t io_run(ImageSet *set, int stage, int progress);
+size_t io_run(ImageSet *set, int stage, size_t first, size_t last,
+              Progress *progress);
+
+/**
+ * @brief Frees the buffers of a range of images.
+ *
+ * Paths, per-stage results and dimensions are kept for benchmarking.
+ *
+ * @param[in,out] set   Image set.
+ * @param[in]     first First image of the range.
+ * @param[in]     last  One past the last image of the range.
+ */
+void io_release(ImageSet *set, size_t first, size_t last);
+
+/**
+ * @brief Clears all per-run state, keeping paths and the output format.
+ *
+ * Call before running the stages again on the same set (e.g. repeated
+ * benchmark trials). Releases any remaining buffers.
+ *
+ * @param[in,out] set Image set.
+ */
+void io_reset(ImageSet *set);
 
 /**
  * @brief Returns the short name of a stage ("read", "decode", ...).

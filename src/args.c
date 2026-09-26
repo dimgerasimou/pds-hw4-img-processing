@@ -5,6 +5,13 @@
  * Provides functions to parse program arguments.
  */
 
+/*
+ * _GNU_SOURCE rather than _POSIX_C_SOURCE: with _POSIX_C_SOURCE alone glibc
+ * maps getopt() to its strict POSIX variant, which stops at the first
+ * operand, so "imgfilter data/ -o out/" would fail. The GNU variant permutes
+ * arguments like the coreutils do; setting POSIXLY_CORRECT in the
+ * environment restores strict POSIX behaviour.
+ */
 #define _GNU_SOURCE
 
 #include <errno.h>
@@ -42,7 +49,10 @@ usage(void)
 		"  -f <format>        Output format: pgm, png  (default: pgm, or the\n"
 		"                     extension of a single -o file)\n"
 		"  -t <threads>       Number of threads        (default: all cores)\n"
+		"  -B <images>        Images per batch, 0 = all at once (default: 256)\n"
 		"  -b <file>          Write benchmark JSON to file, '-' for stdout\n"
+		"  -n <trials>        Timed benchmark trials   (default: 1, needs -b)\n"
+		"  -w <wtrials>       Warmup benchmark trials  (default: 0, needs -b)\n"
 		"  -p                 Show progress bars\n"
 		"  -h                 Show this help message and exit\n\n"
 		"Arguments:\n"
@@ -135,7 +145,10 @@ bad_opt(int opt, int is_missing_arg)
  *   -o <output>   Output file or directory
  *   -f <format>   Output format: pgm or png
  *   -t <threads>  Number of threads (must be > 0)
+ *   -B <images>   Images per batch (0: all at once)
  *   -b <file>     Write benchmark results as JSON ("-" for stdout)
+ *   -n <trials>   Timed benchmark trials (must be > 0, requires -b)
+ *   -w <wtrials>  Warmup benchmark trials (requires -b)
  *   -p            Show progress bars
  *   -h            Show usage and exit
  *
@@ -151,7 +164,7 @@ bad_opt(int opt, int is_missing_arg)
 int
 parse_args(int argc, char *argv[], Args *args)
 {
-	int opt;
+	int opt, repeat = 0;
 
 	if (!args) {
 		DERRF("args is NULL");
@@ -160,7 +173,7 @@ parse_args(int argc, char *argv[], Args *args)
 
 	opterr = 0;
 
-	while ((opt = getopt(argc, argv, "o:f:t:b:ph")) != -1) {
+	while ((opt = getopt(argc, argv, "o:f:t:B:b:n:w:ph")) != -1) {
 		switch (opt) {
 		case 'o':
 			args->output = optarg;
@@ -190,9 +203,40 @@ parse_args(int argc, char *argv[], Args *args)
 			break;
 		}
 
+		case 'B': {
+			unsigned int v;
+			if (!parse_uint(optarg, &v))
+				return bad_num('B');
+			args->batch = v;
+			break;
+		}
+
 		case 'b':
 			args->bench_path = optarg;
 			break;
+
+		case 'n': {
+			unsigned int v;
+			if (!parse_uint(optarg, &v))
+				return bad_num('n');
+			if (v == 0) {
+				uerrf("trials must be > 0");
+				usage();
+				return 1;
+			}
+			args->trials = v;
+			repeat = 1;
+			break;
+		}
+
+		case 'w': {
+			unsigned int v;
+			if (!parse_uint(optarg, &v))
+				return bad_num('w');
+			args->wtrials = v;
+			repeat = 1;
+			break;
+		}
 
 		case 'p':
 			args->progress = 1;
@@ -204,10 +248,18 @@ parse_args(int argc, char *argv[], Args *args)
 
 		case '?':
 		default:
-			if (optopt == 'o' || optopt == 'f' || optopt == 't' || optopt == 'b')
+			if (optopt == 'o' || optopt == 'f' || optopt == 't' || optopt == 'B'
+			    || optopt == 'b' || optopt == 'n' || optopt == 'w')
 				return bad_opt(optopt, 1);
 			return bad_opt(optopt ? optopt : '?', 0);
 		}
+	}
+
+	/* Repeating the work only makes sense when it is being measured */
+	if (repeat && !args->bench_path) {
+		uerrf("-n and -w require -b");
+		usage();
+		return 1;
 	}
 
 	/* Expect exactly one positional argument: the input path */

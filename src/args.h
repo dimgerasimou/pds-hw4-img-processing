@@ -2,7 +2,10 @@
  * @file args.h
  * @brief Command-line argument parsing interface.
  *
- * Supports standard POSIX option parsing.
+ * Declares the structure holding the program's configuration and the
+ * function that fills it from the command line.
+ *
+ * Supports standard POSIX-style option parsing with validation.
  */
 
 #ifndef ARGS_H
@@ -25,6 +28,9 @@ typedef struct {
 	char *bench_path;     /**< Benchmark JSON path (-b), "-" for stdout, NULL: disabled */
 	int format;           /**< Output format (-f), IMG_FMT_UNKNOWN: automatic */
 	unsigned int threads; /**< Number of OpenMP threads (-t) */
+	unsigned int batch;   /**< Images per batch (-B), 0: all images at once */
+	unsigned int trials;  /**< Timed benchmark trials (-n, requires -b) */
+	unsigned int wtrials; /**< Warmup benchmark trials (-w, requires -b) */
 	int progress;         /**< Non-zero to show progress bars (-p) */
 } Args;
 
@@ -42,7 +48,10 @@ typedef struct {
  *   -o <output>   Output file or directory
  *   -f <format>   Output format: pgm or png
  *   -t <threads>  Number of threads (must be > 0)
+ *   -B <images>   Images per batch (0: all at once)
  *   -b <file>     Write benchmark results as JSON ("-" for stdout)
+ *   -n <trials>   Timed benchmark trials (must be > 0, requires -b)
+ *   -w <wtrials>  Warmup benchmark trials (requires -b)
  *   -p            Show progress bars
  *   -h            Show usage and exit
  *

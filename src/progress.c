@@ -13,6 +13,7 @@
 
 #include <omp.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "progress.h"
 
@@ -48,12 +49,16 @@ draw(const Progress *p, size_t done)
 
 	flockfile(stderr);
 	fprintf(stderr, "\r%-6s [%s] %3d%%  %zu/%zu  %.1fs",
-	        p->label, bar, (int)(pct * 100.0), done, p->total, elapsed);
+	        p->label, bar, (int)(pct * 100.0),
+	        done / p->unit, p->total / p->unit, elapsed);
 
 	if (done > 0 && done < p->total) {
 		double eta = elapsed / (double)done * (double)(p->total - done);
 		fprintf(stderr, "  eta %.1fs", eta);
 	}
+
+	if (p->note[0])
+		fprintf(stderr, "  %s", p->note);
 
 	/* clear leftovers from a previously longer line */
 	fputs("\033[K", stderr);
@@ -71,13 +76,17 @@ draw(const Progress *p, size_t done)
  * @param[out] p       Progress bar to initialize.
  * @param[in]  label   Stage label (not copied, must outlive the bar).
  * @param[in]  total   Number of steps (0 is treated as already complete).
+ * @param[in]  unit    Steps per displayed item (0 is treated as 1).
  * @param[in]  enabled Non-zero to draw, zero to make every call a no-op.
  */
 void
-progress_init(Progress *p, const char *label, size_t total, int enabled)
+progress_init(Progress *p, const char *label, size_t total, size_t unit,
+              int enabled)
 {
 	p->label = label ? label : "";
+	p->note[0] = '\0';
 	p->total = total;
+	p->unit = unit ? unit : 1;
 	p->done = 0;
 	p->last_pct = -1;
 	p->start = omp_get_wtime();
@@ -87,6 +96,45 @@ progress_init(Progress *p, const char *label, size_t total, int enabled)
 		p->last_pct = 0;
 		draw(p, 0);
 	}
+}
+
+/**
+ * @brief Changes the label and note, and redraws.
+ *
+ * Must be called from outside any parallel region.
+ *
+ * @param[in,out] p     Progress bar.
+ * @param[in]     label New label (not copied), or NULL to keep the current one.
+ * @param[in]     note  New note (copied, truncated), or NULL to keep the current one.
+ */
+void
+progress_set(Progress *p, const char *label, const char *note)
+{
+	if (label)
+		p->label = label;
+	if (note)
+		snprintf(p->note, sizeof(p->note), "%s", note);
+
+	if (p->enabled)
+		draw(p, p->done);
+}
+
+/**
+ * @brief Erases the bar from the terminal line.
+ *
+ * Use before printing other messages to stderr; the next update redraws it.
+ * Must be called from outside any parallel region.
+ *
+ * @param[in,out] p Progress bar.
+ */
+void
+progress_clear(Progress *p)
+{
+	if (!p->enabled)
+		return;
+
+	fputs("\r\033[K", stderr);
+	fflush(stderr);
 }
 
 /**
