@@ -1,0 +1,68 @@
+/**
+ * @file json.h
+ * @brief Minimal JSON printer for benchmark output.
+ *
+ * Provides functions to print benchmark structures as valid, properly
+ * formatted and escaped JSON to a stream. Designed for easy integration
+ * with analysis pipelines and result collection systems.
+ */
+
+#ifndef JSON_H
+#define JSON_H
+
+#include <stdio.h>
+
+#include "benchmark.h"
+
+/**
+ * @brief Print system information as formatted JSON.
+ *
+ * Outputs a JSON object containing the CPU model, logical core count,
+ * total RAM, and swap space in gigabytes.
+ *
+ * @param[in] f            Output stream.
+ * @param[in] info         Pointer to SystemInfo structure to print.
+ * @param[in] indent_level Number of spaces to indent the output.
+ */
+void print_sys_info(FILE *f, const SystemInfo *info, const unsigned int indent_level);
+
+/**
+ * @brief Print benchmark parameters as formatted JSON.
+ *
+ * Outputs a JSON object containing the timestamp and the thread count.
+ *
+ * @param[in] f            Output stream.
+ * @param[in] info         Pointer to BenchmarkInfo structure to print.
+ * @param[in] indent_level Number of spaces to indent the output.
+ */
+void print_benchmark_info(FILE *f, const BenchmarkInfo *info, const unsigned int indent_level);
+
+/**
+ * @brief Print dataset information as formatted JSON.
+ *
+ * Outputs a JSON object containing the input and output paths, the output
+ * format, the number of images and their input formats, total pixels and
+ * the range of image dimensions.
+ *
+ * @param[in] f            Output stream.
+ * @param[in] info         Pointer to DatasetInfo structure to print.
+ * @param[in] indent_level Number of spaces to indent the output.
+ */
+void print_dataset_info(FILE *f, const DatasetInfo *info, const unsigned int indent_level);
+
+/**
+ * @brief Print the result of one stage as formatted JSON.
+ *
+ * Outputs `"<name>": { ... }` with counts, data volume, wall time,
+ * throughput and per-image statistics, or `"<name>": null` if the stage
+ * did not run.
+ *
+ * @param[in] f            Output stream.
+ * @param[in] name         JSON key of the stage.
+ * @param[in] r            Pointer to StageResult structure to print.
+ * @param[in] indent_level Number of spaces to indent the output.
+ */
+void print_stage_result(FILE *f, const char *name, const StageResult *r,
+                        const unsigned int indent_level);
+
+#endif /* JSON_H */
