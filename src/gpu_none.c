@@ -33,39 +33,29 @@ gpu_shutdown(void)
 }
 
 /**
- * @brief Not available in this build.
+ * @brief Not available in this build: every task is unsupported.
  *
- * @param[in,out] job    Unused.
+ * @param[in,out] tasks  Tasks (status set to IMG_ERR_UNSUPPORTED).
+ * @param[in]     n      Number of tasks.
+ * @param[in]     cs     Unused.
  * @param[in,out] timing Unused.
- * @param[in]     keep   Unused.
+ * @param[in]     done   Called for each task (may be NULL).
+ * @param[in]     ctx    Passed to @p done.
  *
- * @return IMG_ERR_UNSUPPORTED.
+ * @return 0.
  */
-int
-gpu_denoise(NlmJob *job, GpuTiming *timing, int keep)
+size_t
+gpu_run(GpuTask *tasks, size_t n, const CannySetup *cs, GpuTiming *timing,
+        void (*done)(GpuTask *t, void *ctx), void *ctx)
 {
-	(void)job;
+	(void)cs;
 	(void)timing;
-	(void)keep;
-	return IMG_ERR_UNSUPPORTED;
-}
 
-/**
- * @brief Not available in this build.
- *
- * @param[in,out] img    Unused.
- * @param[in]     s      Unused.
- * @param[in,out] timing Unused.
- * @param[in]     on_gpu Unused.
- *
- * @return IMG_ERR_UNSUPPORTED.
- */
-int
-gpu_edges(Image *img, const CannySetup *s, GpuTiming *timing, int on_gpu)
-{
-	(void)img;
-	(void)s;
-	(void)timing;
-	(void)on_gpu;
-	return IMG_ERR_UNSUPPORTED;
+	for (size_t i = 0; i < n; i++) {
+		tasks[i].status = IMG_ERR_UNSUPPORTED;
+		if (done)
+			done(&tasks[i], ctx);
+	}
+
+	return 0;
 }

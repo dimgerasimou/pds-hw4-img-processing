@@ -214,11 +214,12 @@ size_t io_prepare(ImageSet *set, size_t first, size_t last, Progress *progress);
 /**
  * @brief GPU filters: denoises and/or detects the edges of a range.
  *
- * Runs every image through the enabled filters on the GPU, one image after
- * the other: denoising for the images prepared by io_prepare(), then edge
- * detection. An image whose denoising parameters exceed the GPU's limits is
- * denoised on the CPU instead. Meant to run on its own thread while the CPU
- * stages work on other batches.
+ * Hands all images of the range to the GPU (denoising for the images
+ * prepared by io_prepare(), then edge detection), overlapping the copies of
+ * neighboring images with the kernels. An image whose denoising parameters
+ * exceed the GPU's limits is processed on the CPU instead, with the same
+ * result. Meant to run on its own thread while the CPU stages work on other
+ * batches. Stage and per-image times are GPU times (CUDA events).
  *
  * @param[in,out] set      Image set.
  * @param[in]     first    First image of the range.

@@ -1477,87 +1477,189 @@ cpu_fallback(NlmJob *job, unsigned int width, unsigned int patch)
 }
 
 /**
+ * @brief Edge detection of one image on the CPU (fallback of the GPU path).
+ */
+static int
+cpu_edges(Image *img, const CannySetup *cs)
+{
+	CannyScratch *sc = canny_scratch_new((int)img->width, (int)img->height, cs->radius);
+	unsigned char *map = malloc(image_bytes(img));
+	int r;
+
+	if (!sc || !map) {
+		canny_scratch_free(sc);
+		free(map);
+		return IMG_ERR_NOMEM;
+	}
+
+	canny_band(img, cs, 0, (int)img->height, map, sc);
+	canny_scratch_free(sc);
+
+	r = canny_hysteresis(map, (int)img->width, (int)img->height);
+	if (r != IMG_OK) {
+		free(map);
+		return r;
+	}
+
+	free(img->data);
+	img->data = map;
+	return IMG_OK;
+}
+
+/**
+ * @struct GpuCtx
+ * @brief Context of gpu_run()'s completion callback.
+ */
+typedef struct {
+	ImageSet *set;      /**< Image set */
+	Progress *progress; /**< Progress bar */
+} GpuCtx;
+
+/**
+ * @brief gpu_run() completion callback: advances the progress bar by the
+ *        units of the filters the image went through.
+ */
+static void
+gpu_task_done(GpuTask *t, void *ctx)
+{
+	const GpuCtx *g = ctx;
+	const ImageItem *it = t->user;
+	size_t units = 0;
+
+	if (t->job)
+		units += it->units;
+	if (g->set->edges.enabled)
+		units += 1;
+
+	progress_add(g->progress, units);
+}
+
+/**
  * @brief GPU filters: denoises and/or detects the edges of a range.
  *
- * Runs every image through the enabled filters on the GPU, one image after
- * the other: denoising for the images prepared by io_prepare(), then edge
- * detection. An image whose denoising parameters exceed the GPU's limits is
- * denoised on the CPU instead. Meant to run on its own thread while the CPU
- * stages work on other batches.
+ * Hands all images of the range to gpu_run(), which overlaps the copies of
+ * neighboring images with the kernels, then collects the results. An image
+ * whose denoising parameters exceed the GPU's limits is processed on the
+ * CPU instead, with the same result. Meant to run on its own thread while
+ * the CPU stages work on other batches.
+ *
+ * The per-image and stage times of the GPU filters are GPU times (CUDA
+ * events), including each filter's copies.
  *
  * @param[in,out] set      Image set.
  * @param[in]     first    First image of the range.
  * @param[in]     last     One past the last image of the range.
- * @param[in,out] progress Progress bar (advanced per image and filter).
+ * @param[in,out] progress Progress bar (advanced per image).
  *
  * @return Number of stage failures.
  */
 size_t
 io_gpu_filter(ImageSet *set, size_t first, size_t last, Progress *progress)
 {
-	size_t failed_dn = 0, failed_ed = 0;
+	const int dn = set->denoise.enabled, ed = set->edges.enabled;
+	GpuTask *tasks;
+	GpuCtx ctx = { set, progress };
+	size_t n = 0, failed_dn = 0, failed_ed = 0;
 	double wall_dn = 0.0, wall_ed = 0.0;
 
 	if (last > set->count)
 		last = set->count;
 
+	tasks = calloc(last > first ? last - first : 1, sizeof(GpuTask));
+	if (!tasks) {
+		DERRNOF("calloc() failed");
+		return last - first;
+	}
+
+	/* one task per image that goes to the GPU */
 	for (size_t i = first; i < last; i++) {
 		ImageItem *it = &set->items[i];
-		int on_gpu = 0;
-		double ts;
+
+		if (dn) {
+			/* skipped or failed at preparation: already accounted for */
+			if (it->err[STAGE_DENOISE] != IMG_OK) {
+				if (ed) {
+					it->err[STAGE_EDGES] = IO_NOT_DONE;
+					progress_add(progress, 1);
+				}
+				continue;
+			}
+			tasks[n].job = &it->job;
+		} else if (!eligible(set, it, STAGE_EDGES)) {
+			it->err[STAGE_EDGES] = IO_NOT_DONE;
+			progress_add(progress, 1);
+			continue;
+		}
+
+		tasks[n].img = &it->img;
+		tasks[n].user = it;
+		if (ed)
+			it->bytes[STAGE_EDGES] = image_bytes(&it->img);
+		n++;
+	}
+
+	gpu_run(tasks, n, ed ? &set->edges.setup : NULL, &set->gpu_time, gpu_task_done, &ctx);
+
+	/* collect the results */
+	for (size_t k = 0; k < n; k++) {
+		GpuTask *t = &tasks[k];
+		ImageItem *it = t->user;
 		Image out;
-		int r;
+		int r = t->status;
 
-		/* denoising: images prepared by io_prepare() (others already accounted for) */
-		if (set->denoise.enabled && it->err[STAGE_DENOISE] == IMG_OK) {
-			ts = omp_get_wtime();
+		/* denoising the GPU does not support: both filters on the CPU */
+		if (r == IMG_ERR_UNSUPPORTED) {
+			double ts = omp_get_wtime();
 
-			/* followed by edge detection: keep the result on the GPU */
-			r = gpu_denoise(&it->job, &set->gpu_time, set->edges.enabled);
-			on_gpu = (r == IMG_OK && set->edges.enabled);
-			if (r == IMG_ERR_UNSUPPORTED)
-				r = cpu_fallback(&it->job, it->img.width, set->denoise.params.patch);
-
+			r = cpu_fallback(&it->job, it->img.width, set->denoise.params.patch);
 			if (r == IMG_OK) {
 				nlm_job_finish(&it->job, &out);
 				image_free(&it->img);
 				it->img = out;
 			} else {
 				nlm_job_discard(&it->job);
-				failed_dn++;
 			}
+			t->denoise_s = omp_get_wtime() - ts;
 
-			ts = omp_get_wtime() - ts;
-			it->time_s[STAGE_DENOISE] += ts;
-			wall_dn += ts;
 			it->err[STAGE_DENOISE] = r;
-			progress_add(progress, it->units);
+			if (ed) {
+				ts = omp_get_wtime();
+				it->err[STAGE_EDGES] = (r == IMG_OK) ? cpu_edges(&it->img, &set->edges.setup) : IO_NOT_DONE;
+				t->edges_s = omp_get_wtime() - ts;
+			}
+		} else if (t->job) {
+			/* with edges, the edge map is already in the image: the denoised copy is not needed */
+			if (r == IMG_OK && !ed) {
+				nlm_job_finish(&it->job, &out);
+				image_free(&it->img);
+				it->img = out;
+			} else {
+				nlm_job_discard(&it->job);
+			}
+			it->err[STAGE_DENOISE] = r;
+			if (ed)
+				it->err[STAGE_EDGES] = (r == IMG_OK) ? IMG_OK : IO_NOT_DONE;
+		} else {
+			it->err[STAGE_EDGES] = r;
 		}
 
-		/* edge detection, on the denoised or decoded pixels */
-		if (set->edges.enabled) {
-			if (!eligible(set, it, STAGE_EDGES)) {
-				it->err[STAGE_EDGES] = IO_NOT_DONE;
-				progress_add(progress, 1);
-				continue;
-			}
-
-			it->bytes[STAGE_EDGES] = image_bytes(&it->img);
-			ts = omp_get_wtime();
-			r = gpu_edges(&it->img, &set->edges.setup, &set->gpu_time, on_gpu);
-			ts = omp_get_wtime() - ts;
-
-			it->time_s[STAGE_EDGES] = ts;
-			wall_ed += ts;
-			it->err[STAGE_EDGES] = r;
-			failed_ed += (r != IMG_OK);
-			progress_add(progress, 1);
+		if (dn) {
+			it->time_s[STAGE_DENOISE] += t->denoise_s;
+			wall_dn += t->denoise_s;
+			failed_dn += (it->err[STAGE_DENOISE] != IMG_OK);
+		}
+		if (ed) {
+			it->time_s[STAGE_EDGES] = t->edges_s;
+			wall_ed += t->edges_s;
+			failed_ed += (it->err[STAGE_EDGES] != IMG_OK && it->err[STAGE_EDGES] != IO_NOT_DONE);
 		}
 	}
 
-	if (set->denoise.enabled)
+	free(tasks);
+
+	if (dn)
 		stage_done(set, STAGE_DENOISE, wall_dn);
-	if (set->edges.enabled)
+	if (ed)
 		stage_done(set, STAGE_EDGES, wall_ed);
 
 	if ((failed_dn || failed_ed) && !set->quiet) {

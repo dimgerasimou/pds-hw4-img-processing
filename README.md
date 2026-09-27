@@ -277,6 +277,16 @@ its accumulators in registers for the whole loop, so they cost no memory traffic
 method used on the CPU relies on sequential prefix sums and on streaming the image once per offset,
 which suits a GPU poorly; per-block shared-memory sums are the standard GPU formulation.)
 
+**Streams.** Images go through the GPU in two alternating slots, each with its own CUDA stream, device
+buffers and pinned (page-locked) host buffers. While one image's kernels run, the next image is uploaded
+and the previous one downloaded in the other slot: copies from pinned memory are asynchronous and overlap
+with the kernels, and each slot's stream orders the work on its buffers. Only the hysteresis loop waits
+for the GPU, and only for its own image's stream; its first launch group (the most expensive, processing
+every tile) is enqueued before the host copies the neighboring images to and from pinned memory, so the
+GPU works through it meanwhile instead of waiting for the host. This matters most for edge detection alone, whose light
+kernels would otherwise leave the copies (about 40% of its GPU time) exposed. With `-d -e`, the denoised
+image stays on the GPU for edge detection.
+
 **Exactness.** The GPU computes the same integer patch sums, uses the same weights, adds the offsets in
 the same order, and is compiled without fused multiply-add (`-fmad=false`, and no fast math), so its
 output is **bit-for-bit identical** to the CPU's. To verify on a machine with a GPU:
@@ -301,6 +311,43 @@ pipeline hides nearly all of the I/O and codec work behind it.
 
 With the pipeline, stage wall times overlap, so they add up to more than `pipeline_time`; per-image
 denoise time is the CPU preparation plus the GPU run.
+
+## Test Data with Artificial Noise
+
+The chest X-ray datasets are clean, so they measure speed but not denoising quality. `tools/noise.py`
+makes noisy copies of an image or a directory of images, and `tools/compare.py` measures the result
+against the clean originals (PSNR). Both need Python with numpy and Pillow (Arch: `python-numpy
+python-pillow`).
+
+```bash
+tools/noise.py data/clean data/noisy                   # Poisson noise, dose 10-50% per image
+tools/noise.py --dose 0.2 data/clean data/noisy_20     # fixed dose
+tools/noise.py --model gaussian --sigma 20 in.png out.png
+./bin/imgfilter -d -o data/denoised data/noisy
+tools/compare.py data/clean data/noisy data/denoised   # PSNR per set (--per-image: per image)
+```
+
+- **Models.** `poisson` (default): signal-dependent photon-counting noise; a pixel of normalized
+  brightness v receives on average v · photons · dose photons, drawn from a Poisson distribution, so a
+  lower dose means stronger noise, strongest in dark regions. It treats brightness as proportional to the
+  photon count, which in a radiograph displayed with bone white is the other way round: a model of
+  signal-dependent noise, not a physical low-dose simulation. `gaussian`: additive white noise of a given
+  σ, the usual setting in the denoising literature.
+- **Lossless output** (PNG, or PGM with `--format pgm`): saving noisy images as JPEG would partly remove
+  the noise again and add compression artifacts.
+- **Reproducible**: each image's noise is drawn from a generator seeded with `--seed` and the file name,
+  so a file always gets the same noise, whatever the order or subset processed.
+- **Manifest**: `noise.csv` records every image's parameters and the standard deviation of the noise
+  actually added, the ground truth for evaluating denoising and the noise estimate.
+
+Example, four 512×512 crops of a chest X-ray with Poisson noise (dose 10–50%), default NLM parameters:
+
+| | PSNR (mean) | PSNR (worst image) |
+| --- | ---: | ---: |
+| noisy | 27.45 dB | 24.09 dB |
+| denoised | **34.47 dB** | **33.62 dB** |
+
+The noise level estimated by `imgfilter` (mean σ 11.32) matched the added noise (11.41) to within 2%.
 
 ## Batch Processing
 
@@ -374,8 +421,9 @@ document is written containing:
   time over the trials, and `per_image`, the individual image times over all trials; `null` for stages
   that did not run
 - `pipeline_time` — elapsed time of the whole pipeline over the trials
-- `gpu_time` — with `-g`: the GPU's own time (CUDA events), per trial, for uploading images and weight
-  tables, the denoising kernel, the edge kernels (of which hysteresis), and downloading results, plus the
+- `gpu_time` — with `-g`: the GPU's own time (CUDA events recorded right around each piece of work, so
+  idle time between them is not counted), per trial, for uploading images and weight tables, the
+  denoising kernel, the edge kernels (of which hysteresis), and downloading results, plus the
   number of hysteresis launches, the hysteresis tiles processed, and how many all launches would have
   processed with every tile active, totals per trial with statistics over trials;
   `null` otherwise
@@ -457,7 +505,9 @@ src/
     ├── stb_image.h
     └── stb_image_write.h
 tools/
-└── bench.sh        Benchmark sweeps over threads and batch sizes
+├── bench.sh        Benchmark sweeps over threads and batch sizes
+├── noise.py        Noisy test images (Poisson or Gaussian), with a manifest
+└── compare.py      PSNR of processed images against clean references
 ```
 
 ## Third-Party Code

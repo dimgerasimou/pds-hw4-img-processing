@@ -8,11 +8,11 @@
  * Builds without CUDA link gpu_none.c instead, where the GPU is reported as
  * unavailable.
  *
- * The CPU prepares every image as usual (noise estimate, mirrored padding,
- * weight table; see nlm_job_prepare()), the GPU computes the denoised pixels
- * from the padded image and the table, and the CPU collects the result. The
- * GPU computes the same integer patch sums, uses the same weights and adds
- * them in the same order as the CPU, so the output is bit-for-bit identical.
+ * The CPU prepares every image for denoising as usual (noise estimate,
+ * mirrored padding, weight table; see nlm_job_prepare()), and the GPU
+ * computes the denoised pixels and/or the edge map. The GPU performs exactly
+ * the CPU's integer and floating-point operations, in the same order, so the
+ * output is bit-for-bit identical.
  */
 
 #ifndef GPU_H
@@ -60,6 +60,22 @@ typedef struct {
 	double tiles_all;     /**< Hysteresis tiles in all launches (launches x tiles) */
 } GpuTiming;
 
+/* Status of a task still waiting for the GPU (distinct from every IMG_* code) */
+#define GPU_PENDING (-2)
+
+/**
+ * @struct GpuTask
+ * @brief One image for gpu_run().
+ */
+typedef struct {
+	NlmJob *job;      /**< Prepared denoising job, or NULL for edge detection alone */
+	Image *img;       /**< The image (always set): edge input without a job; receives the edge map */
+	int status;       /**< Result: IMG_OK, IMG_ERR_UNSUPPORTED or IMG_ERR_GPU */
+	double denoise_s; /**< GPU time of the denoising part (with its copies) */
+	double edges_s;   /**< GPU time of the edge detection part (with its copies) */
+	void *user;       /**< Caller's data */
+} GpuTask;
+
 /* ------------------------------------------------------------------------- */
 /*                            Public API Functions                           */
 /* ------------------------------------------------------------------------- */
@@ -82,46 +98,34 @@ int gpu_init(GpuInfo *info);
 void gpu_shutdown(void);
 
 /**
- * @brief Denoises a prepared job on the GPU, writing its output image.
+ * @brief Runs a batch of images through the GPU filters, overlapping the
+ *        copies of neighboring images with the kernels.
  *
- * Uploads the padded image and the weight table, runs the kernel and
- * downloads the result into the job's output. Device buffers are reused
- * between calls and grown when needed.
+ * For every task: denoising if it has a prepared job (with noise to
+ * remove), then edge detection if @p cs is given. Two images are in flight
+ * at a time, in alternating slots: while image i's kernels run, image i+1
+ * is uploaded and image i-1 downloaded. The results are identical to the
+ * CPU's.
  *
- * @note Not thread-safe: call from one thread (the pipeline's GPU thread).
- *
- * With @p keep set, the result is left on the GPU for gpu_edges() instead
- * of being downloaded (the job's output buffer is then not filled).
- *
- * @param[in,out] job    Job prepared with nlm_job_prepare().
- * @param[in,out] timing GPU time of the steps, added to (may be NULL).
- * @param[in]     keep   Non-zero to keep the result on the GPU.
- *
- * @return IMG_OK, IMG_ERR_UNSUPPORTED if the job has no weight table (its
- *         parameters need more weights than the table limit; run it on the
- *         CPU instead), or IMG_ERR_GPU on a CUDA error (already reported).
- */
-int gpu_denoise(NlmJob *job, GpuTiming *timing, int keep);
-
-/**
- * @brief Detects the edges of an image on the GPU, replacing it with the
- *        edge map (255 on edges, 0 elsewhere).
- *
- * Uploads the image (or, with @p on_gpu set, uses the result gpu_denoise()
- * kept on the GPU), runs the blur, gradient/suppression and hysteresis
- * kernels, and downloads the edge map into the image's buffer. The result
- * is identical to the CPU's (canny_band() and canny_hysteresis()).
+ * Results: with edge detection, the edge map replaces the task's image
+ * pixels (img->data); with denoising only, it fills the job's output
+ * (job->out.data). A task whose denoising the GPU does not support (its
+ * weight table exceeds the limit) gets IMG_ERR_UNSUPPORTED without any GPU
+ * work, for the caller to process on the CPU.
  *
  * @note Not thread-safe: call from one thread (the pipeline's GPU thread).
  *
- * @param[in,out] img    Image (its pixels are not read when @p on_gpu is set).
- * @param[in]     s      Setup from canny_setup().
+ * @param[in,out] tasks  Tasks; each one's status and times are set.
+ * @param[in]     n      Number of tasks.
+ * @param[in]     cs     Edge detection setup, or NULL for denoising only.
  * @param[in,out] timing GPU time of the steps, added to (may be NULL).
- * @param[in]     on_gpu Non-zero to use the denoised image kept on the GPU.
+ * @param[in]     done   Called for each task when it completes (may be NULL).
+ * @param[in]     ctx    Passed to @p done.
  *
- * @return IMG_OK, or IMG_ERR_GPU on a CUDA error (already reported).
+ * @return Number of tasks that failed on the GPU (IMG_ERR_GPU).
  */
-int gpu_edges(Image *img, const CannySetup *s, GpuTiming *timing, int on_gpu);
+size_t gpu_run(GpuTask *tasks, size_t n, const CannySetup *cs, GpuTiming *timing,
+               void (*done)(GpuTask *t, void *ctx), void *ctx);
 
 #ifdef __cplusplus
 }

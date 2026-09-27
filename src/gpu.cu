@@ -2,6 +2,9 @@
  * @file gpu.cu
  * @brief CUDA implementation of NLM denoising and Canny edge detection.
  *
+ * Images are processed in two alternating slots, each with its own stream,
+ * so that the copies of one image overlap with the kernels of another.
+ *
  * This is the only CUDA translation unit; everything else is C. It contains
  * the kernel and thin wrappers with C linkage (see gpu.h).
  *
@@ -349,8 +352,8 @@ nlm_kernel(const unsigned char *__restrict__ pad, int pw, int ph, int w, int h,
  */
 template <int P>
 static cudaError_t
-launch(dim3 grid, dim3 block, size_t smem, const unsigned char *pad, int pw, int ph,
-       int w, int h, int s, int cutoff, const float *wtab, unsigned char *out)
+launch(dim3 grid, dim3 block, size_t smem, cudaStream_t stream, const unsigned char *pad,
+       int pw, int ph, int w, int h, int s, int cutoff, const float *wtab, unsigned char *out)
 {
 	if (smem > 48 * 1024) {
 		cudaError_t err = cudaFuncSetAttribute(nlm_kernel<P>,
@@ -360,7 +363,7 @@ launch(dim3 grid, dim3 block, size_t smem, const unsigned char *pad, int pw, int
 			return err;
 	}
 
-	nlm_kernel<P><<<grid, block, smem>>>(pad, pw, ph, w, h, s, cutoff, wtab, out);
+	nlm_kernel<P><<<grid, block, smem, stream>>>(pad, pw, ph, w, h, s, cutoff, wtab, out);
 	return cudaGetLastError();
 }
 
@@ -598,32 +601,69 @@ canny_finish_kernel(unsigned char *__restrict__ map, size_t n)
 }
 
 /* ------------------------------------------------------------------------- */
-/*                              Device Buffers                               */
+/*                                  Slots                                    */
 /* ------------------------------------------------------------------------- */
 
-/* Device buffers, reused between images and grown when needed. */
-static unsigned char *d_pad = NULL, *d_out = NULL;
-static float *d_tab = NULL;
-static size_t cap_pad = 0, cap_out = 0, cap_tab = 0;
+/*
+ * Images go through the GPU in two alternating slots, each with its own
+ * stream, device buffers and pinned (page-locked) host buffers. While one
+ * image's kernels run in one slot, the next image is uploaded and the
+ * previous one downloaded in the other: copies from and to pinned memory
+ * run asynchronously, overlapping with the kernels. Work within a slot is
+ * ordered by its stream, which protects the slot's buffers.
+ */
+#define SLOTS 2
 
-/* Edge detection buffers */
-static unsigned char *e_img = NULL, *e_map = NULL, *e_act[2] = { NULL, NULL };
-static int *e_hb = NULL, *e_b = NULL, *e_flag = NULL;
-static size_t cap_eimg = 0, cap_emap = 0, cap_ehb = 0, cap_eb = 0, cap_eflag = 0;
-static size_t cap_eact[2] = { 0, 0 };
-
-/* Events bracketing the steps of one image */
-#define NEV 5
-static cudaEvent_t ev[NEV];
-static int ev_ready = 0;
+/*
+ * Events of an image, in start/end pairs recorded right around each piece
+ * of work, so that time a stream spends waiting for the host between
+ * pieces is not counted: upload, denoising kernel, per-pixel edge kernels,
+ * one hysteresis launch group (reused per group), download.
+ */
+enum {
+	EV_UP0, EV_UP1, EV_DN0, EV_DN1, EV_PX0, EV_PX1, EV_HY0, EV_HY1, EV_DL0, EV_DL1,
+	EV_COUNT
+};
 
 /*
  * Hysteresis launches per check of the "changed" flag. Reading the flag is
  * a synchronization with the GPU; launching a few kernels back to back and
- * checking only the last one saves most of them. Extra launches after the
- * fixed point is reached change nothing.
+ * checking only the last one saves most of them. Extra launches after
+ * convergence find no active tile and cost almost nothing.
  */
 #define HYST_GROUP 4
+
+/**
+ * @struct Buf
+ * @brief A buffer that grows on demand (device or pinned host memory).
+ */
+struct Buf {
+	void *p;    /**< Memory */
+	size_t cap; /**< Size in bytes */
+};
+
+/**
+ * @struct Slot
+ * @brief One image in flight: stream, events, buffers, and its task.
+ */
+struct Slot {
+	cudaStream_t stream;                   /**< Stream of the slot */
+	cudaEvent_t ev[EV_COUNT];              /**< Step boundaries of the image */
+	Buf d_pad, d_tab, d_out;               /**< Denoising, device */
+	Buf e_img, e_hb, e_b, e_map, e_act[2]; /**< Edges, device */
+	Buf e_flag;                            /**< Changed flag, tile counter */
+	Buf h_in, h_tab, h_out, h_flag;        /**< Pinned host staging */
+	GpuTask *task;                         /**< Image in flight, or NULL */
+	int denoise, edges;                    /**< Which filters run on it */
+	int launches;                          /**< Hysteresis launches */
+	double tiles_all;                      /**< Tiles in all its hysteresis launches */
+	double hyst_ms;                        /**< GPU time of its hysteresis groups */
+	int cur;                               /**< Active-tile array of the next launch */
+	int tiles_x, tiles_y;                  /**< Hysteresis tile grid */
+};
+
+static Slot slots[SLOTS];
+static int ready = 0;
 
 /**
  * @brief Reports a CUDA error. Returns 1 if @p err is an error.
@@ -641,20 +681,398 @@ cuda_failed(cudaError_t err, const char *what)
  * @brief Makes sure a device buffer holds at least @p need bytes.
  */
 static int
-reserve(void **buf, size_t *cap, size_t need, const char *what)
+dev_reserve(Buf *b, size_t need, const char *what)
 {
-	if (need <= *cap)
+	if (need <= b->cap)
 		return 0;
 
-	cudaFree(*buf);
-	*buf = NULL;
-	*cap = 0;
+	cudaFree(b->p);
+	b->p = NULL;
+	b->cap = 0;
 
-	if (cuda_failed(cudaMalloc(buf, need), what))
+	if (cuda_failed(cudaMalloc(&b->p, need), what))
 		return 1;
 
-	*cap = need;
+	b->cap = need;
 	return 0;
+}
+
+/**
+ * @brief Makes sure a pinned host buffer holds at least @p need bytes.
+ */
+static int
+host_reserve(Buf *b, size_t need, const char *what)
+{
+	if (need <= b->cap)
+		return 0;
+
+	cudaFreeHost(b->p);
+	b->p = NULL;
+	b->cap = 0;
+
+	if (cuda_failed(cudaHostAlloc(&b->p, need, cudaHostAllocDefault), what))
+		return 1;
+
+	b->cap = need;
+	return 0;
+}
+
+/**
+ * @brief Width and height of a task's image.
+ *
+ * Taken from the image, which every task has: a job with nothing to denoise
+ * (no noise) leaves its context unset.
+ */
+static void
+task_size(const GpuTask *t, int *w, int *h)
+{
+	*w = (int)t->img->width;
+	*h = (int)t->img->height;
+}
+
+/* ------------------------------------------------------------------------- */
+/*                              Per-Slot Steps                               */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * @brief Step 1: copies a task's inputs to pinned memory and starts their
+ *        upload. The slot must be free.
+ *
+ * Denoising uploads the padded image and the weight table; edge detection
+ * alone uploads the image (a job without noise to remove already holds its
+ * output, which is then the edge input).
+ */
+static int
+slot_stage(Slot *s, GpuTask *t, int edges)
+{
+	const NlmContext *c = t->job ? &t->job->ctx : NULL;
+	int w, h;
+	size_t n;
+
+	task_size(t, &w, &h);
+	n = (size_t)w * h;
+
+	s->task = t;
+	s->denoise = (t->job && nlm_job_bands(t->job) > 0);
+	s->edges = edges;
+	s->launches = 0;
+	s->tiles_all = 0.0;
+	s->hyst_ms = 0.0;
+
+	if (s->denoise) {
+		const size_t npad = c->pw * ((size_t)c->h + 2 * (c->p + c->s));
+		const size_t ntab = ((size_t)c->cutoff + 2) * sizeof(float);
+
+		if (host_reserve(&s->h_in, npad, "cudaHostAlloc (image)")
+		    || host_reserve(&s->h_tab, ntab, "cudaHostAlloc (weights)")
+		    || dev_reserve(&s->d_pad, npad, "cudaMalloc (image)")
+		    || dev_reserve(&s->d_tab, ntab, "cudaMalloc (weights)")
+		    || dev_reserve(&s->d_out, n, "cudaMalloc (output)"))
+			return IMG_ERR_GPU;
+
+		memcpy(s->h_in.p, c->pad, npad);
+		memcpy(s->h_tab.p, c->wtab, ntab);
+
+		cudaEventRecord(s->ev[EV_UP0], s->stream);
+		if (cuda_failed(cudaMemcpyAsync(s->d_pad.p, s->h_in.p, npad, cudaMemcpyHostToDevice,
+		                                s->stream), "upload (image)")
+		    || cuda_failed(cudaMemcpyAsync(s->d_tab.p, s->h_tab.p, ntab, cudaMemcpyHostToDevice,
+		                                   s->stream), "upload (weights)"))
+			return IMG_ERR_GPU;
+	} else if (edges) {
+		/* edge input: the image, or the output of a job with nothing to denoise */
+		const unsigned char *src = t->job ? t->job->out.data : t->img->data;
+
+		if (host_reserve(&s->h_in, n, "cudaHostAlloc (image)")
+		    || dev_reserve(&s->e_img, n, "cudaMalloc (edges image)"))
+			return IMG_ERR_GPU;
+
+		memcpy(s->h_in.p, src, n);
+
+		cudaEventRecord(s->ev[EV_UP0], s->stream);
+		if (cuda_failed(cudaMemcpyAsync(s->e_img.p, s->h_in.p, n, cudaMemcpyHostToDevice,
+		                                s->stream), "upload (edges image)"))
+			return IMG_ERR_GPU;
+	}
+
+	cudaEventRecord(s->ev[EV_UP1], s->stream);
+	return IMG_OK;
+}
+
+/**
+ * @brief Step 2: launches the denoising kernel and the per-pixel edge
+ *        kernels (asynchronous).
+ */
+static int
+slot_kernels(Slot *s, const CannySetup *cs)
+{
+	const GpuTask *t = s->task;
+	int w, h;
+	size_t n;
+
+	task_size(t, &w, &h);
+	n = (size_t)w * h;
+
+	if (s->denoise) {
+		const NlmContext *c = &t->job->ctx;
+		const int r = c->p + c->s;
+		dim3 block(BLOCK_W, BLOCK_H);
+		dim3 grid((unsigned)((c->w + TILE_W - 1) / TILE_W), (unsigned)((c->h + TILE_H - 1) / TILE_H));
+		size_t smem = tile_bytes(c->p, c->s);
+		cudaError_t err = cudaSuccess;
+
+		cudaEventRecord(s->ev[EV_DN0], s->stream);
+
+		/* the patch radius is a template parameter: pick its instantiation */
+		switch (c->p) {
+#define CASE(P) case P: err = launch<P>(grid, block, smem, s->stream, (unsigned char *)s->d_pad.p, \
+		                                (int)c->pw, (int)c->h + 2 * r, (int)c->w, (int)c->h, c->s, \
+		                                c->cutoff, (float *)s->d_tab.p, (unsigned char *)s->d_out.p); break;
+		CASE(0) CASE(1) CASE(2) CASE(3) CASE(4) CASE(5)
+		CASE(6) CASE(7) CASE(8) CASE(9) CASE(10)
+#undef CASE
+		}
+
+		if (cuda_failed(err, "denoising kernel"))
+			return IMG_ERR_GPU;
+
+		cudaEventRecord(s->ev[EV_DN1], s->stream);
+	}
+
+	if (s->edges) {
+		dim3 block(CANNY_BW, CANNY_BH);
+		dim3 grid((unsigned)((w + CANNY_BW - 1) / CANNY_BW), (unsigned)((h + CANNY_BH - 1) / CANNY_BH));
+		/* denoised on the GPU: the edge input is already there */
+		const unsigned char *src = s->denoise ? (unsigned char *)s->d_out.p : (unsigned char *)s->e_img.p;
+
+		if (dev_reserve(&s->e_hb, n * sizeof(int), "cudaMalloc (edges blur)")
+		    || dev_reserve(&s->e_b, n * sizeof(int), "cudaMalloc (edges blur)")
+		    || dev_reserve(&s->e_map, n, "cudaMalloc (edges map)"))
+			return IMG_ERR_GPU;
+
+		cudaEventRecord(s->ev[EV_PX0], s->stream);
+		canny_blur_h_kernel<<<grid, block, 0, s->stream>>>(src, (int *)s->e_hb.p, w, h, cs->radius);
+		canny_blur_v_kernel<<<grid, block, 0, s->stream>>>((int *)s->e_hb.p, (int *)s->e_b.p, w, h, cs->radius);
+		canny_classify_kernel<<<grid, block, 0, s->stream>>>((int *)s->e_b.p, (unsigned char *)s->e_map.p,
+		                                                    w, h, cs->low2, cs->high2);
+		if (cuda_failed(cudaGetLastError(), "edge kernels"))
+			return IMG_ERR_GPU;
+
+		cudaEventRecord(s->ev[EV_PX1], s->stream);
+	}
+
+	return IMG_OK;
+}
+
+/**
+ * @brief Enqueues one group of HYST_GROUP hysteresis launches, then the
+ *        download of the flag and tile counter (asynchronous).
+ *
+ * The group is bracketed by the EV_HY0 / EV_HY1 events; its time is added
+ * when the group is checked (slot_hyst_finish()).
+ */
+static int
+hyst_group(Slot *s, int w, int h)
+{
+	const int ntiles = s->tiles_x * s->tiles_y;
+
+	cudaEventRecord(s->ev[EV_HY0], s->stream);
+
+	for (int k = 0; k < HYST_GROUP; k++) {
+		const int last = (k == HYST_GROUP - 1);
+
+		cudaMemsetAsync(s->e_act[1 - s->cur].p, 0, (size_t)ntiles, s->stream);
+		if (last)
+			cudaMemsetAsync(s->e_flag.p, 0, sizeof(int), s->stream);
+
+		canny_hyst_kernel<<<dim3(s->tiles_x, s->tiles_y), dim3(HYST_T, HYST_ROWS), 0, s->stream>>>(
+			(unsigned char *)s->e_map.p, w, h, (unsigned char *)s->e_act[s->cur].p,
+			(unsigned char *)s->e_act[1 - s->cur].p, s->tiles_x, s->tiles_y,
+			last ? (int *)s->e_flag.p : NULL, (int *)s->e_flag.p + 1);
+		s->cur = 1 - s->cur;
+	}
+
+	s->launches += HYST_GROUP;
+	s->tiles_all += (double)HYST_GROUP * ntiles;
+
+	if (cuda_failed(cudaGetLastError(), "hysteresis kernel")
+	    || cuda_failed(cudaMemcpyAsync(s->h_flag.p, s->e_flag.p, 2 * sizeof(int), cudaMemcpyDeviceToHost,
+	                                   s->stream), "download (edges flag)"))
+		return IMG_ERR_GPU;
+
+	cudaEventRecord(s->ev[EV_HY1], s->stream);
+	return IMG_OK;
+}
+
+/**
+ * @brief Step 3a: starts hysteresis: all tiles active, and the first group
+ *        of launches enqueued without waiting.
+ *
+ * The first launch processes every tile and is the most expensive, so the
+ * host can do other work (the neighboring images' copies) meanwhile.
+ */
+static int
+slot_hyst_start(Slot *s)
+{
+	int w, h, ntiles;
+
+	if (!s->edges)
+		return IMG_OK;
+
+	task_size(s->task, &w, &h);
+	s->tiles_x = (w + HYST_T - 1) / HYST_T;
+	s->tiles_y = (h + HYST_T - 1) / HYST_T;
+	ntiles = s->tiles_x * s->tiles_y;
+	s->cur = 0;
+
+	/* e_flag holds the "changed" flag and the processed-tiles counter */
+	if (dev_reserve(&s->e_flag, 2 * sizeof(int), "cudaMalloc (edges flag)")
+	    || dev_reserve(&s->e_act[0], (size_t)ntiles, "cudaMalloc (active tiles)")
+	    || dev_reserve(&s->e_act[1], (size_t)ntiles, "cudaMalloc (active tiles)")
+	    || host_reserve(&s->h_flag, 2 * sizeof(int), "cudaHostAlloc (edges flag)"))
+		return IMG_ERR_GPU;
+
+	cudaMemsetAsync(s->e_act[0].p, 1, (size_t)ntiles, s->stream);
+	cudaMemsetAsync(s->e_flag.p, 0, 2 * sizeof(int), s->stream);
+
+	return hyst_group(s, w, h);
+}
+
+/**
+ * @brief Step 3b: completes hysteresis: waits for each group (only this
+ *        slot's stream), and relaunches until a launch changes nothing,
+ *        processing only the active tiles: all of them at first, then those
+ *        whose neighbors changed their shared border.
+ */
+static int
+slot_hyst_finish(Slot *s)
+{
+	int w, h;
+
+	if (!s->edges)
+		return IMG_OK;
+
+	task_size(s->task, &w, &h);
+
+	for (;;) {
+		float ms = 0.0f;
+
+		if (cuda_failed(cudaStreamSynchronize(s->stream), "cudaStreamSynchronize"))
+			return IMG_ERR_GPU;
+
+		cudaEventElapsedTime(&ms, s->ev[EV_HY0], s->ev[EV_HY1]);
+		s->hyst_ms += ms;
+
+		if (!((int *)s->h_flag.p)[0])
+			return IMG_OK;
+
+		if (hyst_group(s, w, h) != IMG_OK)
+			return IMG_ERR_GPU;
+	}
+}
+
+/**
+ * @brief Step 4: converts the edge classes to the edge map and starts the
+ *        download of the result into pinned memory.
+ */
+static int
+slot_download(Slot *s)
+{
+	int w, h;
+	size_t n;
+
+	task_size(s->task, &w, &h);
+	n = (size_t)w * h;
+
+	if (s->denoise || s->edges) {
+		const void *res = s->edges ? s->e_map.p : s->d_out.p;
+
+		if (host_reserve(&s->h_out, n, "cudaHostAlloc (output)"))
+			return IMG_ERR_GPU;
+
+		cudaEventRecord(s->ev[EV_DL0], s->stream);
+
+		/* classes to the edge map (255 / 0) */
+		if (s->edges) {
+			canny_finish_kernel<<<(unsigned)((n + 255) / 256), 256, 0, s->stream>>>(
+				(unsigned char *)s->e_map.p, n);
+			if (cuda_failed(cudaGetLastError(), "edge map kernel"))
+				return IMG_ERR_GPU;
+		}
+
+		if (cuda_failed(cudaMemcpyAsync(s->h_out.p, res, n, cudaMemcpyDeviceToHost, s->stream),
+		                "download (output)"))
+			return IMG_ERR_GPU;
+
+		cudaEventRecord(s->ev[EV_DL1], s->stream);
+	}
+
+	return IMG_OK;
+}
+
+/**
+ * @brief Step 5: waits for the slot's image, delivers its result, times and
+ *        reports it, and frees the slot.
+ *
+ * The result goes to the image when edges were detected, to the job's
+ * output when only denoised.
+ */
+static void
+slot_finish(Slot *s, int status, GpuTiming *timing, void (*done)(GpuTask *, void *), void *ctx)
+{
+	GpuTask *t = s->task;
+	float up = 0.0f, dn = 0.0f, px = 0.0f, dl = 0.0f;
+
+	if (!t)
+		return;
+
+	if (status == IMG_OK && (s->denoise || s->edges)
+	    && cuda_failed(cudaEventSynchronize(s->ev[EV_DL1]), "cudaEventSynchronize"))
+		status = IMG_ERR_GPU;
+
+	if (status == IMG_OK) {
+		int w, h;
+
+		task_size(t, &w, &h);
+		if (s->edges)
+			memcpy(t->img->data, s->h_out.p, (size_t)w * h);
+		else if (s->denoise)
+			memcpy(t->job->out.data, s->h_out.p, (size_t)w * h);
+
+		/* each piece of work only, between its own pair of events (ms) */
+		if (s->denoise || s->edges) {
+			cudaEventElapsedTime(&up, s->ev[EV_UP0], s->ev[EV_UP1]);
+			cudaEventElapsedTime(&dl, s->ev[EV_DL0], s->ev[EV_DL1]);
+		}
+		if (s->denoise)
+			cudaEventElapsedTime(&dn, s->ev[EV_DN0], s->ev[EV_DN1]);
+		if (s->edges)
+			cudaEventElapsedTime(&px, s->ev[EV_PX0], s->ev[EV_PX1]);
+
+		/* each filter with its own share of the copies */
+		t->denoise_s = s->denoise ? (up + dn + (s->edges ? 0.0 : dl)) / 1000.0 : 0.0;
+		t->edges_s = s->edges ? ((s->denoise ? 0.0 : up) + px + s->hyst_ms + dl) / 1000.0 : 0.0;
+
+		if (timing) {
+			int *hf = (int *)s->h_flag.p;
+
+			timing->upload_s += up / 1000.0;
+			timing->denoise_s += dn / 1000.0;
+			timing->edges_s += (px + s->hyst_ms) / 1000.0;
+			timing->hysteresis_s += s->hyst_ms / 1000.0;
+			timing->download_s += dl / 1000.0;
+			if (s->edges) {
+				timing->launches += s->launches;
+				timing->tiles += hf[1];
+				timing->tiles_all += s->tiles_all;
+			}
+		}
+	}
+
+	t->status = status;
+	s->task = NULL;
+	if (done)
+		done(t, ctx);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -691,11 +1109,18 @@ gpu_init(GpuInfo *info)
 	if (cuda_failed(cudaFree(0), "context creation"))
 		return 1;
 
-	/* blocking-sync events: waiting for them sleeps instead of spinning */
-	for (int i = 0; i < NEV; i++)
-		if (cuda_failed(cudaEventCreateWithFlags(&ev[i], cudaEventBlockingSync), "cudaEventCreate"))
+	memset(slots, 0, sizeof(slots));
+	for (int i = 0; i < SLOTS; i++) {
+		if (cuda_failed(cudaStreamCreateWithFlags(&slots[i].stream, cudaStreamNonBlocking),
+		                "cudaStreamCreate"))
 			return 1;
-	ev_ready = 1;
+		/* blocking-sync events: waiting for them sleeps instead of spinning */
+		for (int k = 0; k < EV_COUNT; k++)
+			if (cuda_failed(cudaEventCreateWithFlags(&slots[i].ev[k], cudaEventBlockingSync),
+			                "cudaEventCreate"))
+				return 1;
+	}
+	ready = 1;
 
 	if (info) {
 		snprintf(info->name, sizeof(info->name), "%s", prop.name);
@@ -716,258 +1141,135 @@ gpu_init(GpuInfo *info)
 extern "C" void
 gpu_shutdown(void)
 {
-	cudaFree(d_pad);
-	cudaFree(d_out);
-	cudaFree(d_tab);
-	d_pad = d_out = NULL;
-	d_tab = NULL;
-	cap_pad = cap_out = cap_tab = 0;
+	if (!ready)
+		return;
 
-	cudaFree(e_img);
-	cudaFree(e_map);
-	cudaFree(e_hb);
-	cudaFree(e_b);
-	cudaFree(e_flag);
-	cudaFree(e_act[0]);
-	cudaFree(e_act[1]);
-	e_img = e_map = e_act[0] = e_act[1] = NULL;
-	e_hb = e_b = e_flag = NULL;
-	cap_eimg = cap_emap = cap_ehb = cap_eb = cap_eflag = 0;
-	cap_eact[0] = cap_eact[1] = 0;
+	for (int i = 0; i < SLOTS; i++) {
+		Slot *s = &slots[i];
+		Buf *dev[] = { &s->d_pad, &s->d_tab, &s->d_out, &s->e_img, &s->e_hb, &s->e_b,
+		               &s->e_map, &s->e_act[0], &s->e_act[1], &s->e_flag };
+		Buf *host[] = { &s->h_in, &s->h_tab, &s->h_out, &s->h_flag };
 
-	if (ev_ready)
-		for (int i = 0; i < NEV; i++)
-			cudaEventDestroy(ev[i]);
-	ev_ready = 0;
+		cudaStreamSynchronize(s->stream);
+		for (size_t k = 0; k < sizeof(dev) / sizeof(dev[0]); k++)
+			cudaFree(dev[k]->p);
+		for (size_t k = 0; k < sizeof(host) / sizeof(host[0]); k++)
+			cudaFreeHost(host[k]->p);
+		for (int k = 0; k < EV_COUNT; k++)
+			cudaEventDestroy(s->ev[k]);
+		cudaStreamDestroy(s->stream);
+	}
+
+	memset(slots, 0, sizeof(slots));
+	ready = 0;
 }
 
 /**
- * @brief Denoises a prepared job on the GPU, writing its output image.
+ * @brief Runs a batch of images through the GPU filters, overlapping the
+ *        copies of neighboring images with the kernels.
  *
- * Uploads the padded image and the weight table, runs the kernel and
- * downloads the result into the job's output. Device buffers are reused
- * between calls and grown when needed.
- *
- * @note Not thread-safe: call from one thread (the pipeline's GPU thread).
- *
- * With @p keep set, the result is left on the GPU for gpu_edges() instead
- * of being downloaded (the job's output buffer is then not filled).
- *
- * @param[in,out] job    Job prepared with nlm_job_prepare().
- * @param[in,out] timing GPU time of the steps, added to (may be NULL).
- * @param[in]     keep   Non-zero to keep the result on the GPU.
- *
- * @return IMG_OK, IMG_ERR_UNSUPPORTED if the job has no weight table, or
- *         IMG_ERR_GPU on a CUDA error (already reported).
- */
-extern "C" int
-gpu_denoise(NlmJob *job, GpuTiming *timing, int keep)
-{
-	const NlmContext *c = &job->ctx;
-	const int r = c->p + c->s;
-	const size_t pw = c->pw;
-	const size_t ph = (size_t)c->h + 2 * r;
-	const size_t npad = pw * ph;
-	const size_t nout = (size_t)c->w * c->h;
-	size_t ntab;
-	cudaError_t err = cudaSuccess;
-	dim3 block(BLOCK_W, BLOCK_H);
-	dim3 grid((unsigned)((c->w + TILE_W - 1) / TILE_W), (unsigned)((c->h + TILE_H - 1) / TILE_H));
-	size_t smem = tile_bytes(c->p, c->s);
-
-	/* no noise: the output was already set when the job was prepared */
-	if (nlm_job_bands(job) == 0)
-		return IMG_OK;
-
-	/* the GPU always reads weights from the table, and has kernels up to MAX_P */
-	if (!c->wtab || c->p > MAX_P)
-		return IMG_ERR_UNSUPPORTED;
-
-	ntab = (size_t)c->cutoff + 2;
-
-	if (reserve((void **)&d_pad, &cap_pad, npad, "cudaMalloc (image)")
-	    || reserve((void **)&d_out, &cap_out, nout, "cudaMalloc (output)")
-	    || reserve((void **)&d_tab, &cap_tab, ntab * sizeof(float), "cudaMalloc (weights)"))
-		return IMG_ERR_GPU;
-
-	cudaEventRecord(ev[0]);
-
-	if (cuda_failed(cudaMemcpy(d_pad, c->pad, npad, cudaMemcpyHostToDevice), "upload (image)")
-	    || cuda_failed(cudaMemcpy(d_tab, c->wtab, ntab * sizeof(float), cudaMemcpyHostToDevice),
-	                   "upload (weights)"))
-		return IMG_ERR_GPU;
-
-	cudaEventRecord(ev[1]);
-
-	/* the patch radius is a template parameter: pick its instantiation */
-	switch (c->p) {
-#define CASE(P) case P: err = launch<P>(grid, block, smem, d_pad, (int)pw, (int)ph, \
-	                                (int)c->w, (int)c->h, c->s, c->cutoff, d_tab, d_out); break;
-	CASE(0) CASE(1) CASE(2) CASE(3) CASE(4) CASE(5)
-	CASE(6) CASE(7) CASE(8) CASE(9) CASE(10)
-#undef CASE
-	}
-
-	cudaEventRecord(ev[2]);
-
-	if (cuda_failed(err, "kernel launch"))
-		return IMG_ERR_GPU;
-
-	/* kept on the GPU for edge detection: no download */
-	if (!keep && cuda_failed(cudaMemcpy(job->out.data, d_out, nout, cudaMemcpyDeviceToHost),
-	                         "download (output)"))
-		return IMG_ERR_GPU;
-
-	cudaEventRecord(ev[3]);
-
-	if (timing) {
-		float up = 0.0f, kern = 0.0f, down = 0.0f;
-
-		if (cuda_failed(cudaEventSynchronize(ev[3]), "cudaEventSynchronize"))
-			return IMG_ERR_GPU;
-
-		cudaEventElapsedTime(&up, ev[0], ev[1]);
-		cudaEventElapsedTime(&kern, ev[1], ev[2]);
-		cudaEventElapsedTime(&down, ev[2], ev[3]);
-		timing->upload_s += up / 1000.0;
-		timing->denoise_s += kern / 1000.0;
-		timing->download_s += down / 1000.0;
-	}
-
-	return IMG_OK;
-}
-
-/**
- * @brief Detects the edges of an image on the GPU, replacing it with the
- *        edge map (255 on edges, 0 elsewhere).
- *
- * Uploads the image (or, with @p on_gpu set, uses the result gpu_denoise()
- * kept on the GPU), runs the blur, gradient/suppression and hysteresis
- * kernels, and downloads the edge map into the image's buffer. The result
- * is identical to the CPU's (canny_band() and canny_hysteresis()).
+ * For every task: denoising if it has a prepared job (with noise to
+ * remove), then edge detection if @p cs is given. Two images are in flight
+ * at a time, in alternating slots: while image i's kernels run, image i+1
+ * is uploaded and image i-1 downloaded. A task whose denoising the GPU does
+ * not support gets IMG_ERR_UNSUPPORTED without any GPU work, for the caller
+ * to process on the CPU.
  *
  * @note Not thread-safe: call from one thread (the pipeline's GPU thread).
  *
- * @param[in,out] img    Image (its pixels are not read when @p on_gpu is set).
- * @param[in]     s      Setup from canny_setup().
+ * @param[in,out] tasks  Tasks; each one's status and times are set.
+ * @param[in]     n      Number of tasks.
+ * @param[in]     cs     Edge detection setup, or NULL for denoising only.
  * @param[in,out] timing GPU time of the steps, added to (may be NULL).
- * @param[in]     on_gpu Non-zero to use the denoised image kept on the GPU.
+ * @param[in]     done   Called for each task when it completes (may be NULL).
+ * @param[in]     ctx    Passed to @p done.
  *
- * @return IMG_OK, or IMG_ERR_GPU on a CUDA error (already reported).
+ * @return Number of tasks that failed on the GPU (IMG_ERR_GPU).
  */
-extern "C" int
-gpu_edges(Image *img, const CannySetup *s, GpuTiming *timing, int on_gpu)
+extern "C" size_t
+gpu_run(GpuTask *tasks, size_t n, const CannySetup *cs, GpuTiming *timing,
+        void (*done)(GpuTask *, void *), void *ctx)
 {
-	const int w = (int)img->width, h = (int)img->height;
-	const size_t n = (size_t)w * h;
-	dim3 block(CANNY_BW, CANNY_BH);
-	dim3 grid((unsigned)((w + CANNY_BW - 1) / CANNY_BW), (unsigned)((h + CANNY_BH - 1) / CANNY_BH));
-	dim3 hblock(HYST_T, HYST_ROWS);
-	dim3 hgrid((unsigned)((w + HYST_T - 1) / HYST_T), (unsigned)((h + HYST_T - 1) / HYST_T));
-	const int ntiles = (int)(hgrid.x * hgrid.y);
-	const unsigned char *src;
-	int flag, launches = 0, cur = 0, counts[2];
+	size_t failed = 0, k = 0, cur = 0;
+	int err = IMG_OK;
 
-	/* e_flag holds the "changed" flag and the processed-tiles counter */
-	if (reserve((void **)&e_img, &cap_eimg, n, "cudaMalloc (edges image)")
-	    || reserve((void **)&e_map, &cap_emap, n, "cudaMalloc (edges map)")
-	    || reserve((void **)&e_hb, &cap_ehb, n * sizeof(int), "cudaMalloc (edges blur)")
-	    || reserve((void **)&e_b, &cap_eb, n * sizeof(int), "cudaMalloc (edges blur)")
-	    || reserve((void **)&e_flag, &cap_eflag, 2 * sizeof(int), "cudaMalloc (edges flag)")
-	    || reserve((void **)&e_act[0], &cap_eact[0], (size_t)ntiles, "cudaMalloc (active tiles)")
-	    || reserve((void **)&e_act[1], &cap_eact[1], (size_t)ntiles, "cudaMalloc (active tiles)"))
-		return IMG_ERR_GPU;
+	/* the Gaussian weights are the same for every image of the run */
+	if (cs && cuda_failed(cudaMemcpyToSymbol(c_weights, cs->weights,
+	                                         sizeof(int) * (2 * cs->radius + 1)),
+	                      "upload (Gaussian weights)"))
+		err = IMG_ERR_GPU;
 
-	if (cuda_failed(cudaMemcpyToSymbol(c_weights, s->weights, sizeof(int) * (2 * s->radius + 1)),
-	                "upload (Gaussian weights)"))
-		return IMG_ERR_GPU;
+	/* tasks needing no GPU: unsupported denoising, or nothing to do */
+	for (size_t i = 0; i < n; i++) {
+		GpuTask *t = &tasks[i];
+		const int dn = (t->job && nlm_job_bands(t->job) > 0);
 
-	cudaEventRecord(ev[0]);
+		t->status = GPU_PENDING;
+		t->denoise_s = t->edges_s = 0.0;
 
-	/* the denoised image is already on the GPU, in the denoising output */
-	if (on_gpu) {
-		src = d_out;
-	} else {
-		if (cuda_failed(cudaMemcpy(e_img, img->data, n, cudaMemcpyHostToDevice), "upload (edges image)"))
-			return IMG_ERR_GPU;
-		src = e_img;
+		if (dn && (!t->job->ctx.wtab || t->job->ctx.p > MAX_P))
+			t->status = IMG_ERR_UNSUPPORTED;
+		else if (!dn && !cs)
+			t->status = IMG_OK;  /* denoising only, no noise: output already set */
+
+		if (t->status != GPU_PENDING && done)
+			done(t, ctx);
 	}
 
-	cudaEventRecord(ev[1]);
+	/* the next task needing the GPU, from index k */
+#define NEXT(k) do { while ((k) < n && tasks[(k)].status != GPU_PENDING) (k)++; } while (0)
 
-	canny_blur_h_kernel<<<grid, block>>>(src, e_hb, w, h, s->radius);
-	canny_blur_v_kernel<<<grid, block>>>(e_hb, e_b, w, h, s->radius);
-	canny_classify_kernel<<<grid, block>>>(e_b, e_map, w, h, s->low2, s->high2);
-	if (cuda_failed(cudaGetLastError(), "edge kernels"))
-		return IMG_ERR_GPU;
+	NEXT(k);
+	if (k < n && err == IMG_OK)
+		err = slot_stage(&slots[cur], &tasks[k], cs != NULL);
 
-	cudaEventRecord(ev[2]);
+	while (k < n && err == IMG_OK) {
+		Slot *s = &slots[cur], *o = &slots[1 - cur];
+		size_t next = k + 1;
 
-	/*
-	 * Hysteresis: relaunch until a launch changes nothing, processing only
-	 * the active tiles: all of them at first, then those whose neighbors
-	 * changed their shared border. The flag is only checked on every
-	 * HYST_GROUP-th launch (each check waits for the GPU); launches after
-	 * convergence find no active tile and cost almost nothing.
-	 */
-	if (cuda_failed(cudaMemsetAsync(e_act[0], 1, (size_t)ntiles), "cudaMemset (active tiles)")
-	    || cuda_failed(cudaMemsetAsync(e_flag, 0, 2 * sizeof(int)), "cudaMemset (edges flag)"))
-		return IMG_ERR_GPU;
+		/*
+		 * 1. this image's kernels and its first (most expensive) hysteresis
+		 *    launch group, asynchronously
+		 */
+		err = slot_kernels(s, cs);
+		if (err == IMG_OK)
+			err = slot_hyst_start(s);
 
-	do {
-		for (int k = 0; k < HYST_GROUP; k++) {
-			const int last = (k == HYST_GROUP - 1);
+		/* 2. meanwhile, free the other slot (previous image) and stage the next image */
+		NEXT(next);
+		if (o->task)
+			slot_finish(o, IMG_OK, timing, done, ctx);
+		if (err == IMG_OK && next < n)
+			err = slot_stage(o, &tasks[next], cs != NULL);
 
-			cudaMemsetAsync(e_act[1 - cur], 0, (size_t)ntiles);
-			if (last)
-				cudaMemsetAsync(e_flag, 0, sizeof(int));
+		/* 3.-4. the rest of this image's hysteresis, then its download, asynchronously */
+		if (err == IMG_OK)
+			err = slot_hyst_finish(s);
+		if (err == IMG_OK)
+			err = slot_download(s);
 
-			canny_hyst_kernel<<<hgrid, hblock>>>(e_map, w, h, e_act[cur], e_act[1 - cur],
-			                                     (int)hgrid.x, (int)hgrid.y,
-			                                     last ? e_flag : NULL, e_flag + 1);
-			cur = 1 - cur;
+		if (err != IMG_OK)
+			break;
+
+		k = next;
+		cur = 1 - cur;
+	}
+#undef NEXT
+
+	/* complete what is in flight; on an error, fail it and everything left */
+	for (int i = 0; i < SLOTS; i++)
+		if (slots[(cur + i) % SLOTS].task)
+			slot_finish(&slots[(cur + i) % SLOTS], err == IMG_OK ? IMG_OK : IMG_ERR_GPU,
+			            timing, done, ctx);
+
+	for (size_t i = 0; i < n; i++) {
+		if (tasks[i].status == GPU_PENDING) {
+			tasks[i].status = IMG_ERR_GPU;
+			if (done)
+				done(&tasks[i], ctx);
 		}
-		launches += HYST_GROUP;
-
-		if (cuda_failed(cudaGetLastError(), "hysteresis kernel")
-		    || cuda_failed(cudaMemcpy(&flag, e_flag, sizeof(int), cudaMemcpyDeviceToHost),
-		                   "download (edges flag)"))
-			return IMG_ERR_GPU;
-	} while (flag);
-
-	if (cuda_failed(cudaMemcpy(counts, e_flag, 2 * sizeof(int), cudaMemcpyDeviceToHost),
-	                "download (tile count)"))
-		return IMG_ERR_GPU;
-
-	canny_finish_kernel<<<(unsigned)((n + 255) / 256), 256>>>(e_map, n);
-	if (cuda_failed(cudaGetLastError(), "edge map kernel"))
-		return IMG_ERR_GPU;
-
-	cudaEventRecord(ev[3]);
-
-	if (cuda_failed(cudaMemcpy(img->data, e_map, n, cudaMemcpyDeviceToHost), "download (edge map)"))
-		return IMG_ERR_GPU;
-
-	cudaEventRecord(ev[4]);
-
-	if (timing) {
-		float up = 0.0f, pix = 0.0f, hyst = 0.0f, down = 0.0f;
-
-		if (cuda_failed(cudaEventSynchronize(ev[4]), "cudaEventSynchronize"))
-			return IMG_ERR_GPU;
-
-		cudaEventElapsedTime(&up, ev[0], ev[1]);
-		cudaEventElapsedTime(&pix, ev[1], ev[2]);
-		cudaEventElapsedTime(&hyst, ev[2], ev[3]);
-		cudaEventElapsedTime(&down, ev[3], ev[4]);
-		timing->upload_s += up / 1000.0;
-		timing->edges_s += (pix + hyst) / 1000.0;
-		timing->hysteresis_s += hyst / 1000.0;
-		timing->download_s += down / 1000.0;
-		timing->launches += launches;
-		timing->tiles += counts[1];
-		timing->tiles_all += (double)launches * ntiles;
+		failed += (tasks[i].status == IMG_ERR_GPU);
 	}
 
-	return IMG_OK;
+	return failed;
 }
