@@ -11,6 +11,7 @@
 #ifndef ARGS_H
 #define ARGS_H
 
+#include "canny.h"
 #include "nlm.h"
 
 /* ------------------------------------------------------------------------- */
@@ -35,7 +36,9 @@ typedef struct {
 	unsigned int wtrials; /**< Warmup benchmark trials (-w, requires -b) */
 	int progress;         /**< Non-zero to show progress bars (-p) */
 	int denoise;          /**< Non-zero to run NLM denoising (-d) */
-	int gpu;              /**< Non-zero to denoise on the GPU (-g) */
+	int gpu;              /**< Non-zero to run the filters on the GPU (-g) */
+	int edges;            /**< Non-zero to detect edges (-e) */
+	CannyParams canny;    /**< Edge detector parameters (-G, -l, -u) */
 	NlmParams nlm;        /**< NLM parameters (-P, -S, -H, -N) */
 } Args;
 
@@ -59,7 +62,11 @@ typedef struct {
  *   -w <wtrials>  Warmup benchmark trials (requires -b)
  *   -p            Show progress bars
  *   -d            Denoise with Non-Local Means
- *   -g            Denoise on the GPU (CUDA), pipelined with the CPU stages
+ *   -g            Run the filters on the GPU (CUDA), pipelined with the CPU stages
+ *   -e            Detect edges (Canny); the output is the edge map
+ *   -G <sigma>    Canny Gaussian standard deviation
+ *   -l <low>      Canny low threshold
+ *   -u <high>     Canny high threshold
  *   -P <radius>   NLM patch radius
  *   -S <radius>   NLM search radius
  *   -H <k>        NLM strength, h = k * sigma

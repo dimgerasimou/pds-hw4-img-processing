@@ -25,7 +25,7 @@
 #include "error.h"
 #include "image.h"
 
-/* Largest accepted NLM radii; beyond these the cost explodes for no gain */
+/* Largest accepted NLM radii; beyond these the cost explodes for no gain (Gaussian sigma: 10) */
 #define MAX_PATCH_RADIUS  10
 #define MAX_SEARCH_RADIUS 50
 
@@ -62,12 +62,19 @@ usage(void)
 		"  -h                 Show this help message and exit\n\n"
 		"Denoising (Non-Local Means):\n"
 		"  -d                 Enable denoising\n"
-		"  -g                 Denoise on the GPU (CUDA); the CPU reads, decodes,\n"
-		"                     encodes and writes other batches meanwhile\n"
+		"  -g                 Run the filters on the GPU (CUDA); the CPU reads,\n"
+		"                     decodes, encodes and writes other batches meanwhile\n"
 		"  -P <radius>        Patch radius, patches are (2r+1)^2   (default: 2)\n"
 		"  -S <radius>        Search radius, window is (2r+1)^2    (default: 10)\n"
 		"  -H <k>             Strength, h = k * sigma              (default: 0.4)\n"
 		"  -N <sigma>         Noise standard deviation (default: estimated per image)\n\n"
+		"Edge detection (Canny), after denoising if both are enabled:\n"
+		"  -e                 Enable; the output is the edge map (255 = edge)\n"
+		"  -G <sigma>         Gaussian blur standard deviation, 0 = none (default: 1.4)\n"
+		"  -l <low>           Low threshold, gradient magnitude    (default: 20)\n"
+		"  -u <high>          High threshold, gradient magnitude   (default: 50)\n"
+		"                       pixels above high are edges, pixels above low are\n"
+		"                       edges if connected to one\n\n"
 		"Arguments:\n"
 		"  input              Image or directory of images\n"
 		"                     (PGM, PNG, JPEG, BMP, TGA; converted to grayscale)\n\n"
@@ -81,8 +88,9 @@ usage(void)
 		"  %s -t 8 -o out/ data/\n"
 		"  %s -p -b results.json -f png -o out/ data/\n"
 		"  %s -d -P 3 -S 7 -o clean.pgm noisy.png\n"
-		"  %s -d -g -p -o clean/ xrays/\n",
-		program_name, program_name, program_name, program_name, program_name
+		"  %s -d -g -p -o clean/ xrays/\n"
+		"  %s -d -e -g -o edges/ xrays/\n",
+		program_name, program_name, program_name, program_name, program_name, program_name
 	);
 
 	free(program_name);
@@ -194,7 +202,11 @@ bad_opt(int opt, int is_missing_arg)
  *   -w <wtrials>  Warmup benchmark trials (requires -b)
  *   -p            Show progress bars
  *   -d            Denoise with Non-Local Means
- *   -g            Denoise on the GPU (CUDA), pipelined with the CPU stages
+ *   -g            Run the filters on the GPU (CUDA), pipelined with the CPU stages
+ *   -e            Detect edges (Canny); the output is the edge map
+ *   -G <sigma>    Canny Gaussian standard deviation
+ *   -l <low>      Canny low threshold
+ *   -u <high>     Canny high threshold
  *   -P <radius>   NLM patch radius
  *   -S <radius>   NLM search radius
  *   -H <k>        NLM strength, h = k * sigma
@@ -213,7 +225,7 @@ bad_opt(int opt, int is_missing_arg)
 int
 parse_args(int argc, char *argv[], Args *args)
 {
-	int opt, repeat = 0, nlm_opt = 0;
+	int opt, repeat = 0, nlm_opt = 0, canny_opt = 0;
 
 	if (!args) {
 		DERRF("args is NULL");
@@ -222,7 +234,7 @@ parse_args(int argc, char *argv[], Args *args)
 
 	opterr = 0;
 
-	while ((opt = getopt(argc, argv, "o:f:t:B:b:n:w:pdgP:S:H:N:h")) != -1) {
+	while ((opt = getopt(argc, argv, "o:f:t:B:b:n:w:pdgP:S:H:N:eG:l:u:h")) != -1) {
 		switch (opt) {
 		case 'o':
 			args->output = optarg;
@@ -297,8 +309,38 @@ parse_args(int argc, char *argv[], Args *args)
 
 		case 'g':
 			args->gpu = 1;
-			nlm_opt = 1;
 			break;
+
+		case 'e':
+			args->edges = 1;
+			break;
+
+		case 'G': {
+			double v;
+			if (!parse_udouble(optarg, &v) || v > 10.0)
+				return bad_num('G');
+			args->canny.sigma = v;
+			canny_opt = 1;
+			break;
+		}
+
+		case 'l': {
+			double v;
+			if (!parse_udouble(optarg, &v))
+				return bad_num('l');
+			args->canny.low = v;
+			canny_opt = 1;
+			break;
+		}
+
+		case 'u': {
+			double v;
+			if (!parse_udouble(optarg, &v))
+				return bad_num('u');
+			args->canny.high = v;
+			canny_opt = 1;
+			break;
+		}
 
 		case 'P': {
 			unsigned int v;
@@ -354,7 +396,8 @@ parse_args(int argc, char *argv[], Args *args)
 		default:
 			if (optopt == 'o' || optopt == 'f' || optopt == 't' || optopt == 'B'
 			    || optopt == 'b' || optopt == 'n' || optopt == 'w' || optopt == 'P'
-			    || optopt == 'S' || optopt == 'H' || optopt == 'N')
+			    || optopt == 'S' || optopt == 'H' || optopt == 'N' || optopt == 'G'
+			    || optopt == 'l' || optopt == 'u')
 				return bad_opt(optopt, 1);
 			return bad_opt(optopt ? optopt : '?', 0);
 		}
@@ -362,7 +405,25 @@ parse_args(int argc, char *argv[], Args *args)
 
 	/* Filter options without the filter are almost certainly a mistake */
 	if (nlm_opt && !args->denoise) {
-		uerrf("-g, -P, -S, -H and -N require -d");
+		uerrf("-P, -S, -H and -N require -d");
+		usage();
+		return 1;
+	}
+
+	if (canny_opt && !args->edges) {
+		uerrf("-G, -l and -u require -e");
+		usage();
+		return 1;
+	}
+
+	if (args->gpu && !args->denoise && !args->edges) {
+		uerrf("-g requires -d or -e");
+		usage();
+		return 1;
+	}
+
+	if (args->edges && args->canny.low > args->canny.high) {
+		uerrf("low threshold (-l) must not exceed high threshold (-u)");
 		usage();
 		return 1;
 	}

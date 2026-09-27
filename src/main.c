@@ -8,15 +8,17 @@
  * Aristotle University of Thessaloniki.
  *
  * Reads an image or a directory of images, optionally denoises them with
- * Non-Local Means, and optionally writes the results. Images are processed
+ * Non-Local Means and/or detects their edges with Canny, and optionally
+ * writes the results. Images are processed
  * in batches to bound memory use; within a batch, every stage is
  * parallelized with OpenMP, across images, and denoising also within them.
- * With -g, denoising runs on the GPU (CUDA), pipelined with the CPU stages. Timings can be written as JSON for
+ * With -g, the filters run on the GPU (CUDA), pipelined with the CPU stages. Timings can be written as JSON for
  * benchmarking.
  *
  * Usage: ./imgfilter [-o output] [-f format] [-t threads] [-B batch]
  *                    [-b bench.json [-n trials] [-w wtrials]] [-p]
- *                    [-d [-g] [-P patch] [-S search] [-H k] [-N sigma]] <input>
+ *                    [-d [-P patch] [-S search] [-H k] [-N sigma]]
+ *                    [-e [-G sigma] [-l low] [-u high]] [-g] <input>
  */
 
 #include <omp.h>
@@ -52,6 +54,11 @@
 #define DEFAULT_NLM_SEARCH 10   /* 21x21 search window */
 #define DEFAULT_NLM_H      0.4  /* h = 0.4 * sigma */
 #define DEFAULT_NLM_SIGMA  -1.0 /* estimate per image */
+
+/* Canny defaults: sigma 1.4 is the classic choice; thresholds in gradient units */
+#define DEFAULT_CANNY_SIGMA 1.4
+#define DEFAULT_CANNY_LOW   20.0
+#define DEFAULT_CANNY_HIGH  50.0
 
 /* ------------------------------------------------------------------------- */
 /*                            Static Helper Functions                        */
@@ -89,7 +96,8 @@ run_pipeline(ImageSet *set, size_t batch, int write, Progress *progress)
 		if (set->denoise.enabled)
 			failed += io_run(set, STAGE_DENOISE, first, last, progress);
 
-		/* TODO: Canny edge detection runs here */
+		if (set->edges.enabled)
+			failed += io_run(set, STAGE_EDGES, first, last, progress);
 
 		/* Save images: pixels -> memory -> file */
 		if (write) {
@@ -114,7 +122,7 @@ batch_range(const ImageSet *set, size_t batch, size_t b, size_t *first, size_t *
 }
 
 /**
- * @brief GPU pipeline, CPU part: loads and prepares batch @p b.
+ * @brief GPU pipeline, CPU part: loads (and prepares for denoising) batch @p b.
  */
 static size_t
 gpu_load(ImageSet *set, size_t batch, size_t b, Progress *progress)
@@ -124,7 +132,8 @@ gpu_load(ImageSet *set, size_t batch, size_t b, Progress *progress)
 	batch_range(set, batch, b, &first, &last);
 	failed += io_run(set, STAGE_READ, first, last, progress);
 	failed += io_run(set, STAGE_DECODE, first, last, progress);
-	failed += io_prepare(set, first, last, progress);
+	if (set->denoise.enabled)
+		failed += io_prepare(set, first, last, progress);
 	return failed;
 }
 
@@ -146,9 +155,9 @@ gpu_store(ImageSet *set, size_t batch, size_t b, int write, Progress *progress)
 }
 
 /**
- * @brief Runs the pipeline once with denoising on the GPU.
+ * @brief Runs the pipeline once with the filters on the GPU.
  *
- * Three batches are in flight at a time: while the GPU denoises batch k,
+ * Three batches are in flight at a time: while the GPU filters batch k,
  * the CPU loads and prepares batch k+1 and encodes and writes batch k-1.
  * Two OpenMP sections run side by side; the GPU one is a single thread that
  * sleeps while waiting for the GPU, the CPU one uses all threads in its own
@@ -179,7 +188,7 @@ run_pipeline_gpu(ImageSet *set, size_t batch, int write, Progress *progress)
 				size_t first, last;
 
 				batch_range(set, batch, b, &first, &last);
-				f_gpu = io_gpu_denoise(set, first, last, progress);
+				f_gpu = io_gpu_filter(set, first, last, progress);
 			}
 
 			#pragma omp section
@@ -241,6 +250,12 @@ main(int argc, char *argv[])
 		.progress   = DEFAULT_PROGRESS,
 		.denoise    = 0,
 		.gpu        = 0,
+		.edges      = 0,
+		.canny      = {
+			.sigma = DEFAULT_CANNY_SIGMA,
+			.low   = DEFAULT_CANNY_LOW,
+			.high  = DEFAULT_CANNY_HIGH,
+		},
 		.nlm        = {
 			.patch    = DEFAULT_NLM_PATCH,
 			.search   = DEFAULT_NLM_SEARCH,
@@ -286,6 +301,9 @@ main(int argc, char *argv[])
 	/* Filter configuration */
 	set.denoise.enabled = args.denoise;
 	set.denoise.params = args.nlm;
+	set.edges.enabled = args.edges;
+	set.edges.params = args.canny;
+	canny_setup(&args.canny, &set.edges.setup);
 
 	/* Batch size: 0 means the whole set at once */
 	batch = (args.batch == 0 || args.batch > set.count) ? set.count : args.batch;
@@ -294,7 +312,8 @@ main(int argc, char *argv[])
 	/* Initialize benchmark structure */
 	if (args.bench_path) {
 		bench = benchmark_init(args.input, args.output, args.threads, args.trials,
-		                       args.wtrials, batch, batches, set.count, &set.denoise);
+		                       args.wtrials, batch, batches, set.count, &set.denoise,
+		                       &set.edges);
 		if (!bench)
 			goto cleanup;
 		if (gpu_ready)

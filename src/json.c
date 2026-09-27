@@ -217,6 +217,37 @@ print_denoise_info(FILE *f, const DenoiseInfo *info, const unsigned int indent_l
 }
 
 /**
+ * @brief Print the edge detection configuration as formatted JSON.
+ *
+ * Outputs `"edges": null` if the stage is disabled, otherwise the device and
+ * the detector parameters (with the Gaussian radius used).
+ *
+ * @param[in] f            Output stream.
+ * @param[in] cfg          Pointer to EdgesConfig structure to print.
+ * @param[in] gpu          Non-zero if the filters ran on the GPU.
+ * @param[in] indent_level Number of spaces to indent the output.
+ */
+void
+print_edges_info(FILE *f, const EdgesConfig *cfg, int gpu, const unsigned int indent_level)
+{
+	fprintf(f, "%*s\"edges\": ", indent_level, "");
+
+	if (!cfg->enabled) {
+		fputs("null", f);
+		return;
+	}
+
+	fprintf(f, "{\n");
+	fprintf(f, "%*s\"algorithm\": \"canny\",\n", indent_level + 2, "");
+	fprintf(f, "%*s\"device\": \"%s\",\n", indent_level + 2, "", gpu ? "cuda" : "cpu");
+	fprintf(f, "%*s\"sigma\": %.4f,\n", indent_level + 2, "", cfg->params.sigma);
+	fprintf(f, "%*s\"gaussian_radius\": %d,\n", indent_level + 2, "", cfg->setup.radius);
+	fprintf(f, "%*s\"low\": %.4f,\n", indent_level + 2, "", cfg->params.low);
+	fprintf(f, "%*s\"high\": %.4f\n", indent_level + 2, "", cfg->params.high);
+	fprintf(f, "%*s}", indent_level, "");
+}
+
+/**
  * @brief Print a timing summary as formatted JSON.
  *
  * Outputs `"<name>": { mean, std_dev, median, min, max, total }`.

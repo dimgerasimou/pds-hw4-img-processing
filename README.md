@@ -11,8 +11,8 @@ Assignment #4 of the **Parallel and Distributed Systems** coursework: [parallel-
 **Canny edge detection** on multicore CPUs (**OpenMP**) and **single NVIDIA GPUs** (**CUDA**), with a strong
 emphasis on comparing parallelization strategies and reproducible benchmarking.
 
-> **Status:** the I/O pipeline, benchmarking, and NLM denoising on the CPU (OpenMP) and the GPU (CUDA)
-> are implemented. Canny edge detection is in progress.
+> **Status:** the I/O pipeline, benchmarking, NLM denoising and Canny edge detection, on the CPU
+> (OpenMP) and the GPU (CUDA), are implemented.
 
 ## Overview
 
@@ -40,8 +40,8 @@ impractical.
 - Automated benchmarking with **JSON output**: system information, dataset information, and per-stage
   wall time, throughput and per-image statistics
 - **Non-Local Means denoising** with integral images, parallelized over bands of all images of a batch
-- **GPU denoising** (CUDA), pipelined with the CPU stages, bit-for-bit identical to the CPU
-- Planned: **Canny edge detection** — sequential, OpenMP and CUDA
+- **Canny edge detection**, with integer arithmetic shared by CPU and GPU
+- **GPU filters** (CUDA), pipelined with the CPU stages, bit-for-bit identical to the CPU
 
 ## Build
 
@@ -82,7 +82,8 @@ Without a CUDA toolkit the program builds CPU-only and `-g` reports that CUDA is
 | `-w <n>`      | Warmup benchmark trials (default: 0, requires `-b`)     |
 | `-p`          | Show progress bars (on stderr)                          |
 | `-d`          | Denoise with Non-Local Means (see below)                |
-| `-g`          | Denoise on the GPU (CUDA), pipelined with the CPU stages |
+| `-e`          | Detect edges with Canny; the output is the edge map (see below) |
+| `-g`          | Run the filters on the GPU (CUDA), pipelined with the CPU stages |
 | `-h`          | Show help                                               |
 
 Input and output follow the conventions of `cp`:
@@ -216,10 +217,56 @@ The output is identical for any thread count; `-t 1` is the serial baseline.
 ./bin/imgfilter -d -H 0.6 -N 20 -o clean.pgm noisy.png
 ```
 
-## GPU Denoising
+## Edge Detection
 
-`-g` runs the denoising on the GPU. The CPU still prepares every image (noise estimate, mirrored padding,
-weight table) and the GPU computes the denoised pixels.
+`-e` runs Canny edge detection (J. Canny, *A Computational Approach to Edge Detection*, IEEE PAMI, 1986);
+with `-d` as well, it runs on the denoised image. The output is the edge map: 255 on edges, 0 elsewhere.
+
+| Step | | Option |
+| ---- | --- | ------ |
+| 1. Gaussian blur | suppresses noise before differentiating | `-G <σ>` (default 1.4; 0 = none) |
+| 2. Sobel gradients | strength and direction of the intensity change | |
+| 3. Non-maximum suppression | keeps a pixel only if it is the strongest along its gradient direction, thinning edges to one pixel | |
+| 4. Hysteresis | pixels above the high threshold are edges; pixels above the low threshold are edges if 8-connected to one | `-l <low>` (default 20), `-u <high>` (default 50) |
+
+Thresholds are gradient magnitudes of the 8-bit image (Sobel), the same units as OpenCV's Canny. On a chest
+X-ray the defaults find the ribs and the larger vessels; the result agrees with OpenCV's Canny (same blur
+and thresholds, L2 gradient) to within one pixel for 86–92% of the edge pixels, the difference coming
+mostly from the blur, which here keeps 1/256 gray-level precision instead of rounding to 8 bits.
+
+**Integer arithmetic.** The Gaussian weights are integers summing to 256, the blurred image is kept in
+units of 1/256 gray level, gradient magnitudes are compared squared as 64-bit integers, and directions are
+quantized by exact integer comparisons with tan 22.5°. The per-pixel arithmetic lives in `canny_core.h`,
+compiled into both the C code and the CUDA kernels, so both run exactly the same operations and produce
+identical edge maps. The CPU implementation was checked against an independent NumPy implementation of
+the same specification.
+
+**Parallelization.** On the CPU, as for denoising, the images of a batch are split into bands of rows
+(16–64) that the threads draw from one pool, widest images first. Each band computes its blur and gradients
+in small per-thread buffers, including a few border rows that neighboring bands compute again; no
+full-image intermediate arrays are kept, so memory does not grow with the batch. The thread that completes
+the last band of an image runs its hysteresis (a flood fill from the strong edges) right away, overlapping
+it with other images' bands. Away from the image border the per-pixel functions skip the mirroring of
+indices (same values, same order), which together with the cache-sized buffers made the single-thread
+time 2.3× lower (199 → 87 ms on a 1857×1317 X-ray).
+
+On the GPU, the per-pixel steps are one thread per pixel, and hysteresis is iterative:
+each block propagates edges through weak pixels within its 32×32 tile in shared memory until nothing
+changes (`__syncthreads_or`), and the host relaunches until a launch changes nothing, checking the
+"changed" flag only every 4th launch to save synchronizations. Only *active* tiles do any work: all of
+them in the first launch, then only those whose neighbor changed a pixel on their shared border (a side,
+or a corner for diagonal neighbors); a tile can have work left only in that case, so the result stays
+exact. On chest X-rays about 5–10% of the tile runs of all launches remain, and launches after
+convergence cost almost nothing. The result is the
+unique set of weak pixels connected to a strong one, independent of the propagation order, so it equals
+the flood fill's. Buffers stay on the GPU between steps: one upload and one download per image. With
+`-d -e`, the denoised image stays on the GPU for edge detection instead of being downloaded and uploaded
+again.
+
+## GPU Filters
+
+`-g` runs the filters (denoising and/or edge detection) on the GPU. For denoising, the CPU still prepares
+every image (noise estimate, mirrored padding, weight table) and the GPU computes the denoised pixels.
 
 **Kernel.** One thread per output pixel, in blocks of 32×16. A block loads its tile of the padded image,
 plus a border of P+S pixels, into shared memory once, then loops over all offsets of the search window:
@@ -243,7 +290,7 @@ diff -r cpu/ gpu/ && echo identical
 An image whose parameters need a larger weight table than the limit (very strong noise with very large
 patches) is denoised on the CPU instead, with the same result.
 
-**Pipeline.** With the GPU, three batches are in flight: while the GPU denoises batch *k*, the CPU reads,
+**Pipeline.** With the GPU, three batches are in flight: while the GPU filters batch *k*, the CPU reads,
 decodes and prepares batch *k+1* and encodes and writes batch *k−1*. Two OpenMP sections run side by
 side: the GPU one is a single thread that sleeps while waiting for the GPU (blocking synchronization), the
 CPU one uses all threads in its own nested parallel regions. Memory is therefore about three batches.
@@ -321,13 +368,16 @@ document is written containing:
   range of dimensions
 - `denoise` — `null`, or the device (`cpu` or `cuda`), the NLM parameters and the noise levels σ used
   (mean / min / max over the images)
+- `edges` — `null`, or the device and the Canny parameters (with the Gaussian radius used)
 - `results` — for each stage: images processed and failed, data volume, throughput, and two timing
   summaries (mean / median / standard deviation / min / max / total): `wall_time`, the stage's elapsed
   time over the trials, and `per_image`, the individual image times over all trials; `null` for stages
   that did not run
 - `pipeline_time` — elapsed time of the whole pipeline over the trials
-- `gpu_time` — with `-g`: the GPU's own time (CUDA events) for uploading the images and weight tables,
-  running the kernel, and downloading the results, totals per trial with statistics over trials;
+- `gpu_time` — with `-g`: the GPU's own time (CUDA events), per trial, for uploading images and weight
+  tables, the denoising kernel, the edge kernels (of which hysteresis), and downloading results, plus the
+  number of hysteresis launches, the hysteresis tiles processed, and how many all launches would have
+  processed with every tile active, totals per trial with statistics over trials;
   `null` otherwise
 - `memory` — peak resident memory, and major/minor page faults during the timed trials
 
@@ -335,7 +385,8 @@ document is written containing:
 | -------- | -------------------------- | ------------------------ |
 | `read`   | file → memory (pure I/O)   | bytes read               |
 | `decode` | memory → pixels (CPU)      | pixel bytes produced     |
-| `denoise`| pixels → pixels (CPU)      | pixel bytes filtered     |
+| `denoise`| pixels → pixels (CPU/GPU)  | pixel bytes filtered     |
+| `edges`  | pixels → edge map (CPU/GPU)| pixel bytes filtered     |
 | `encode` | pixels → memory (CPU)      | pixel bytes consumed     |
 | `write`  | memory → file (pure I/O)   | bytes written            |
 
@@ -392,6 +443,8 @@ src/
 ├── io.[ch]         Input/output resolution and parallel loading/saving
 ├── image.[ch]      Image container and codecs
 ├── nlm.[ch]        Non-Local Means denoising and noise estimation
+├── canny.[ch]      Canny edge detection (CPU)
+├── canny_core.h    Canny per-pixel arithmetic, shared by CPU and GPU
 ├── gpu.h           GPU backend interface
 ├── gpu.cu          CUDA kernel and wrappers (the only CUDA file)
 ├── gpu_none.c      GPU backend for builds without CUDA

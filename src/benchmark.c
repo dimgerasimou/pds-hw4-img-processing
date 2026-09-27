@@ -256,7 +256,7 @@ summarize(Benchmark *b)
 
 	calcstatistics(b->pipeline, n, &b->pipeline_time);
 
-	for (int k = 0; k < 3; k++)
+	for (int k = 0; k < GPU_METRICS; k++)
 		calcstatistics(b->gpu[k], n, &b->gpu_time[k]);
 }
 
@@ -304,6 +304,7 @@ now_sec(void)
  * @param[in] batches Number of batches per trial.
  * @param[in] images  Number of images in the set.
  * @param[in] denoise Denoising stage configuration.
+ * @param[in] edges   Edge detection stage configuration.
  *
  * @return Pointer to a newly allocated Benchmark structure, or NULL on failure.
  */
@@ -311,7 +312,7 @@ Benchmark*
 benchmark_init(const char *input, const char *output, const unsigned int threads,
                const unsigned int trials, const unsigned int wtrials,
                const size_t batch, const size_t batches, const size_t images,
-               const DenoiseConfig *denoise)
+               const DenoiseConfig *denoise, const EdgesConfig *edges)
 {
 	Benchmark *b;
 
@@ -339,7 +340,7 @@ benchmark_init(const char *input, const char *output, const unsigned int threads
 	if (!b->pipeline)
 		goto fail;
 
-	for (int k = 0; k < 3; k++) {
+	for (int k = 0; k < GPU_METRICS; k++) {
 		b->gpu[k] = calloc(trials, sizeof(double));
 		if (!b->gpu[k])
 			goto fail;
@@ -355,6 +356,8 @@ benchmark_init(const char *input, const char *output, const unsigned int threads
 	b->benchmark_info.batches = batches;
 	if (denoise)
 		b->denoise_info.config = *denoise;
+	if (edges)
+		b->edges_info = *edges;
 	gettimestamp(b);
 	getcpuinfo(b);
 	getmeminfo(b);
@@ -381,7 +384,7 @@ benchmark_set_gpu(Benchmark *b, const GpuInfo *info)
 
 	b->sys_info.has_gpu = 1;
 	b->sys_info.gpu = *info;
-	b->denoise_info.gpu = 1;
+	b->denoise_info.gpu = 1;   /* the filters run on the GPU */
 }
 
 /**
@@ -400,7 +403,7 @@ benchmark_free(Benchmark *b)
 		free(b->samples[s]);
 	}
 	free(b->pipeline);
-	for (int k = 0; k < 3; k++)
+	for (int k = 0; k < GPU_METRICS; k++)
 		free(b->gpu[k]);
 	free(b);
 }
@@ -456,9 +459,14 @@ benchmark_trial_end(Benchmark *b, const ImageSet *set)
 
 	t = b->trials_done++;
 	b->pipeline[t] = elapsed;
-	b->gpu[0][t] = set->gpu_time.upload_s;
-	b->gpu[1][t] = set->gpu_time.kernel_s;
-	b->gpu[2][t] = set->gpu_time.download_s;
+	b->gpu[GPU_UPLOAD][t] = set->gpu_time.upload_s;
+	b->gpu[GPU_DENOISE][t] = set->gpu_time.denoise_s;
+	b->gpu[GPU_EDGES][t] = set->gpu_time.edges_s;
+	b->gpu[GPU_HYSTERESIS][t] = set->gpu_time.hysteresis_s;
+	b->gpu[GPU_DOWNLOAD][t] = set->gpu_time.download_s;
+	b->gpu[GPU_LAUNCHES][t] = set->gpu_time.launches;
+	b->gpu[GPU_TILES][t] = set->gpu_time.tiles;
+	b->gpu[GPU_TILES_ALL][t] = set->gpu_time.tiles_all;
 
 	for (int s = 0; s < STAGE_COUNT; s++) {
 		StageResult *r = &b->results[s];
@@ -546,6 +554,8 @@ benchmark_write(Benchmark *b, const char *path)
 	fprintf(f, ",\n");
 	print_denoise_info(f, &b->denoise_info, JSON_INDENT);
 	fprintf(f, ",\n");
+	print_edges_info(f, &b->edges_info, b->denoise_info.gpu, JSON_INDENT);
+	fprintf(f, ",\n");
 	fprintf(f, "%*s\"results\": {\n", JSON_INDENT, "");
 	for (int s = 0; s < STAGE_COUNT; s++) {
 		print_stage_result(f, io_stage_name(s), &b->results[s], JSON_INDENT + 2);
@@ -555,18 +565,33 @@ benchmark_write(Benchmark *b, const char *path)
 	print_statistics(f, "pipeline_time", &b->pipeline_time, JSON_INDENT);
 	fprintf(f, ",\n");
 
-	/* GPU time per step, over trials, measured by the GPU (CUDA events) */
+	/*
+	 * GPU time per step, over trials, measured by the GPU (CUDA events);
+	 * hysteresis is part of edges_kernels. Launches and tiles (processed,
+	 * and what all launches would process if every tile were active):
+	 * medians over trials.
+	 */
 	fprintf(f, "%*s\"gpu_time\": ", JSON_INDENT, "");
 	if (!b->denoise_info.gpu) {
 		fputs("null,\n", f);
 	} else {
 		fprintf(f, "{\n");
-		print_statistics(f, "upload", &b->gpu_time[0], JSON_INDENT + 2);
+		print_statistics(f, "upload", &b->gpu_time[GPU_UPLOAD], JSON_INDENT + 2);
 		fprintf(f, ",\n");
-		print_statistics(f, "kernel", &b->gpu_time[1], JSON_INDENT + 2);
+		print_statistics(f, "denoise_kernel", &b->gpu_time[GPU_DENOISE], JSON_INDENT + 2);
 		fprintf(f, ",\n");
-		print_statistics(f, "download", &b->gpu_time[2], JSON_INDENT + 2);
-		fprintf(f, "\n%*s},\n", JSON_INDENT, "");
+		print_statistics(f, "edges_kernels", &b->gpu_time[GPU_EDGES], JSON_INDENT + 2);
+		fprintf(f, ",\n");
+		print_statistics(f, "hysteresis", &b->gpu_time[GPU_HYSTERESIS], JSON_INDENT + 2);
+		fprintf(f, ",\n");
+		print_statistics(f, "download", &b->gpu_time[GPU_DOWNLOAD], JSON_INDENT + 2);
+		fprintf(f, ",\n%*s\"hysteresis_launches\": %.0f,\n", JSON_INDENT + 2, "",
+		        b->gpu_time[GPU_LAUNCHES].median_time_s);
+		fprintf(f, "%*s\"hysteresis_tiles\": %.0f,\n", JSON_INDENT + 2, "",
+		        b->gpu_time[GPU_TILES].median_time_s);
+		fprintf(f, "%*s\"hysteresis_tiles_if_all_active\": %.0f\n", JSON_INDENT + 2, "",
+		        b->gpu_time[GPU_TILES_ALL].median_time_s);
+		fprintf(f, "%*s},\n", JSON_INDENT, "");
 	}
 	print_memory_info(f, &b->memory, JSON_INDENT);
 	fprintf(f, "\n}\n");

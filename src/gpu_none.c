@@ -37,13 +37,35 @@ gpu_shutdown(void)
  *
  * @param[in,out] job    Unused.
  * @param[in,out] timing Unused.
+ * @param[in]     keep   Unused.
  *
  * @return IMG_ERR_UNSUPPORTED.
  */
 int
-gpu_denoise(NlmJob *job, GpuTiming *timing)
+gpu_denoise(NlmJob *job, GpuTiming *timing, int keep)
 {
 	(void)job;
 	(void)timing;
+	(void)keep;
+	return IMG_ERR_UNSUPPORTED;
+}
+
+/**
+ * @brief Not available in this build.
+ *
+ * @param[in,out] img    Unused.
+ * @param[in]     s      Unused.
+ * @param[in,out] timing Unused.
+ * @param[in]     on_gpu Unused.
+ *
+ * @return IMG_ERR_UNSUPPORTED.
+ */
+int
+gpu_edges(Image *img, const CannySetup *s, GpuTiming *timing, int on_gpu)
+{
+	(void)img;
+	(void)s;
+	(void)timing;
+	(void)on_gpu;
 	return IMG_ERR_UNSUPPORTED;
 }

@@ -26,6 +26,7 @@
  *   read    file   -> memory   (pure I/O)
  *   decode  memory -> pixels   (pure CPU)
  *   denoise pixels -> pixels   (optional, NLM)
+ *   edges   pixels -> pixels   (optional, Canny edge map)
  *   encode  pixels -> memory   (pure CPU)
  *   write   memory -> file     (pure I/O)
  *
@@ -47,6 +48,7 @@
 
 #include <stddef.h>
 
+#include "canny.h"
 #include "gpu.h"
 #include "image.h"
 #include "nlm.h"
@@ -67,6 +69,7 @@ enum {
 	STAGE_READ = 0, /**< Read file contents into memory */
 	STAGE_DECODE,   /**< Decode memory into pixels */
 	STAGE_DENOISE,  /**< NLM denoising of the pixels */
+	STAGE_EDGES,    /**< Canny edge detection (replaces the pixels) */
 	STAGE_ENCODE,   /**< Encode pixels into memory */
 	STAGE_WRITE,    /**< Write memory to file */
 	STAGE_COUNT     /**< Sentinel: number of stages */
@@ -84,6 +87,16 @@ typedef struct {
 	int enabled;      /**< Non-zero to run the stage */
 	NlmParams params; /**< Filter parameters */
 } DenoiseConfig;
+
+/**
+ * @struct EdgesConfig
+ * @brief Configuration of the edge detection stage.
+ */
+typedef struct {
+	int enabled;       /**< Non-zero to run the stage */
+	CannyParams params; /**< Detector parameters */
+	CannySetup setup;  /**< Values derived from the parameters */
+} EdgesConfig;
 
 /**
  * @struct ImageItem
@@ -118,7 +131,8 @@ typedef struct {
 	int out_format;                 /**< Output format (IMG_FMT_*) */
 	int quiet;                      /**< Non-zero to not report failures */
 	DenoiseConfig denoise;          /**< Denoising stage configuration */
-	GpuTiming gpu_time;             /**< GPU time of the run (GPU denoising only) */
+	EdgesConfig edges;              /**< Edge detection stage configuration */
+	GpuTiming gpu_time;             /**< GPU time of the run (GPU filters only) */
 	int performed[STAGE_COUNT];     /**< 1 if the stage ran */
 	double wall_time_s[STAGE_COUNT];/**< Elapsed time of each stage, summed over batches */
 } ImageSet;
@@ -186,7 +200,7 @@ size_t io_run(ImageSet *set, int stage, size_t first, size_t last,
  * Computes, for every image, the noise estimate, the mirrored padding and
  * the weight table (nlm_job_prepare()), in parallel over the images (or,
  * with fewer images than threads, one image at a time with all threads).
- * The prepared jobs are kept in the items for io_gpu_denoise().
+ * The prepared jobs are kept in the items for io_gpu_filter().
  *
  * @param[in,out] set      Image set (denoising must be enabled).
  * @param[in]     first    First image of the range.
@@ -198,21 +212,22 @@ size_t io_run(ImageSet *set, int stage, size_t first, size_t last,
 size_t io_prepare(ImageSet *set, size_t first, size_t last, Progress *progress);
 
 /**
- * @brief GPU denoising, GPU part: denoises the prepared images of a range.
+ * @brief GPU filters: denoises and/or detects the edges of a range.
  *
- * Runs every image prepared by io_prepare() through the GPU, one after the
- * other, and replaces its pixels with the result. An image whose parameters
- * exceed the GPU's weight table limit is denoised on the CPU instead. Meant
- * to run on its own thread while the CPU stages work on other batches.
+ * Runs every image through the enabled filters on the GPU, one image after
+ * the other: denoising for the images prepared by io_prepare(), then edge
+ * detection. An image whose denoising parameters exceed the GPU's limits is
+ * denoised on the CPU instead. Meant to run on its own thread while the CPU
+ * stages work on other batches.
  *
  * @param[in,out] set      Image set.
  * @param[in]     first    First image of the range.
  * @param[in]     last     One past the last image of the range.
- * @param[in,out] progress Progress bar (advanced per image).
+ * @param[in,out] progress Progress bar (advanced per image and filter).
  *
- * @return Number of images that failed.
+ * @return Number of stage failures.
  */
-size_t io_gpu_denoise(ImageSet *set, size_t first, size_t last, Progress *progress);
+size_t io_gpu_filter(ImageSet *set, size_t first, size_t last, Progress *progress);
 
 /**
  * @brief Frees the buffers of a range of images.

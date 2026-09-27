@@ -89,6 +89,22 @@ typedef struct {
 	double sigma_max;     /**< Largest noise standard deviation used */
 } DenoiseInfo;
 
+/*
+ * GPU metrics recorded per trial: the fields of GpuTiming, in this order
+ * (the last one is a count of hysteresis launches, not a time).
+ */
+enum {
+	GPU_UPLOAD = 0,
+	GPU_DENOISE,
+	GPU_EDGES,
+	GPU_HYSTERESIS,
+	GPU_DOWNLOAD,
+	GPU_LAUNCHES,
+	GPU_TILES,
+	GPU_TILES_ALL,
+	GPU_METRICS
+};
+
 /**
  * @struct BenchmarkInfo
  * @brief Benchmark execution parameters.
@@ -145,9 +161,10 @@ typedef struct {
 	BenchmarkInfo benchmark_info;     /**< Benchmark parameters */
 	DatasetInfo dataset_info;         /**< Image set information */
 	DenoiseInfo denoise_info;         /**< Denoising configuration and noise */
+	EdgesConfig edges_info;           /**< Edge detection configuration */
 	StageResult results[STAGE_COUNT]; /**< Per-stage results */
 	Statistics pipeline_time;         /**< Whole-pipeline time over trials */
-	Statistics gpu_time[3];           /**< GPU upload/kernel/download time over trials */
+	Statistics gpu_time[GPU_METRICS]; /**< GPU times per step over trials (see GPU_* below) */
 	MemoryInfo memory;                /**< Memory usage */
 
 	/* raw samples, internal */
@@ -157,7 +174,7 @@ typedef struct {
 	double *samples[STAGE_COUNT];     /**< Per-image times, all trials */
 	size_t nsamples[STAGE_COUNT];     /**< Number of per-image samples */
 	double *pipeline;                 /**< Whole-pipeline time per trial */
-	double *gpu[3];                   /**< GPU upload/kernel/download time per trial */
+	double *gpu[GPU_METRICS];         /**< GPU times per step and launches, per trial */
 	double trial_start;               /**< Start time of the current trial */
 	long majflt_start;                /**< Major faults at trial start */
 	long minflt_start;                /**< Minor faults at trial start */
@@ -192,6 +209,7 @@ double now_sec(void);
  * @param[in] batches Number of batches per trial.
  * @param[in] images  Number of images in the set.
  * @param[in] denoise Denoising stage configuration.
+ * @param[in] edges   Edge detection stage configuration.
  *
  * @return Pointer to a newly allocated Benchmark structure, or NULL on failure.
  */
@@ -199,7 +217,7 @@ Benchmark* benchmark_init(const char *input, const char *output,
                           const unsigned int threads, const unsigned int trials,
                           const unsigned int wtrials, const size_t batch,
                           const size_t batches, const size_t images,
-                          const DenoiseConfig *denoise);
+                          const DenoiseConfig *denoise, const EdgesConfig *edges);
 
 /**
  * @brief Records the GPU used for the run.

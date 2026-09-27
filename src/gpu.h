@@ -1,6 +1,6 @@
 /**
  * @file gpu.h
- * @brief GPU (CUDA) backend for NLM denoising.
+ * @brief GPU (CUDA) backend for NLM denoising and Canny edge detection.
  *
  * Declares the C interface to the CUDA code. Following the same split as the
  * rest of the project, all program logic stays in C; the CUDA translation
@@ -18,6 +18,7 @@
 #ifndef GPU_H
 #define GPU_H
 
+#include "canny.h"
 #include "nlm.h"
 
 #ifdef __cplusplus
@@ -44,14 +45,19 @@ typedef struct {
 
 /**
  * @struct GpuTiming
- * @brief GPU time spent on denoising, split by step, in seconds.
+ * @brief GPU time of the filters, split by step, in seconds.
  *
  * Measured with CUDA events, i.e. by the GPU itself.
  */
 typedef struct {
-	double upload_s;   /**< Host to device: padded image and weight table */
-	double kernel_s;   /**< The NLM kernel */
-	double download_s; /**< Device to host: denoised image */
+	double upload_s;      /**< Host to device: images and weight tables */
+	double denoise_s;     /**< NLM kernel */
+	double edges_s;       /**< Canny kernels, hysteresis included */
+	double hysteresis_s;  /**< Canny hysteresis kernels (part of edges_s) */
+	double download_s;    /**< Device to host: results */
+	double launches;      /**< Hysteresis kernel launches */
+	double tiles;         /**< Hysteresis tiles processed (active tiles) */
+	double tiles_all;     /**< Hysteresis tiles in all launches (launches x tiles) */
 } GpuTiming;
 
 /* ------------------------------------------------------------------------- */
@@ -84,14 +90,38 @@ void gpu_shutdown(void);
  *
  * @note Not thread-safe: call from one thread (the pipeline's GPU thread).
  *
+ * With @p keep set, the result is left on the GPU for gpu_edges() instead
+ * of being downloaded (the job's output buffer is then not filled).
+ *
  * @param[in,out] job    Job prepared with nlm_job_prepare().
- * @param[in,out] timing GPU time of the three steps, added to (may be NULL).
+ * @param[in,out] timing GPU time of the steps, added to (may be NULL).
+ * @param[in]     keep   Non-zero to keep the result on the GPU.
  *
  * @return IMG_OK, IMG_ERR_UNSUPPORTED if the job has no weight table (its
  *         parameters need more weights than the table limit; run it on the
  *         CPU instead), or IMG_ERR_GPU on a CUDA error (already reported).
  */
-int gpu_denoise(NlmJob *job, GpuTiming *timing);
+int gpu_denoise(NlmJob *job, GpuTiming *timing, int keep);
+
+/**
+ * @brief Detects the edges of an image on the GPU, replacing it with the
+ *        edge map (255 on edges, 0 elsewhere).
+ *
+ * Uploads the image (or, with @p on_gpu set, uses the result gpu_denoise()
+ * kept on the GPU), runs the blur, gradient/suppression and hysteresis
+ * kernels, and downloads the edge map into the image's buffer. The result
+ * is identical to the CPU's (canny_band() and canny_hysteresis()).
+ *
+ * @note Not thread-safe: call from one thread (the pipeline's GPU thread).
+ *
+ * @param[in,out] img    Image (its pixels are not read when @p on_gpu is set).
+ * @param[in]     s      Setup from canny_setup().
+ * @param[in,out] timing GPU time of the steps, added to (may be NULL).
+ * @param[in]     on_gpu Non-zero to use the denoised image kept on the GPU.
+ *
+ * @return IMG_OK, or IMG_ERR_GPU on a CUDA error (already reported).
+ */
+int gpu_edges(Image *img, const CannySetup *s, GpuTiming *timing, int on_gpu);
 
 #ifdef __cplusplus
 }

@@ -1,6 +1,6 @@
 /**
  * @file gpu.cu
- * @brief CUDA implementation of NLM denoising.
+ * @brief CUDA implementation of NLM denoising and Canny edge detection.
  *
  * This is the only CUDA translation unit; everything else is C. It contains
  * the kernel and thin wrappers with C linkage (see gpu.h).
@@ -39,6 +39,7 @@
 
 /* project headers are C: give their declarations C linkage */
 extern "C" {
+#include "canny.h"
 #include "error.h"
 #include "nlm.h"
 }
@@ -364,6 +365,239 @@ launch(dim3 grid, dim3 block, size_t smem, const unsigned char *pad, int pw, int
 }
 
 /* ------------------------------------------------------------------------- */
+/*                              Canny Kernels                                */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * The per-pixel steps call the same functions as the CPU (canny_core.h).
+ * Hysteresis uses tiles of HYST_T x HYST_T pixels, each thread handling
+ * HYST_T / HYST_ROWS pixels of a column.
+ */
+#define CANNY_BW  32
+#define CANNY_BH  8
+#define HYST_T    32
+#define HYST_ROWS 8
+
+/* Gaussian weights of the current image */
+__constant__ int c_weights[2 * CANNY_MAX_RADIUS + 1];
+
+/**
+ * @brief Horizontal Gaussian pass, one thread per pixel.
+ */
+__global__ void
+canny_blur_h_kernel(const unsigned char *__restrict__ img, int *__restrict__ hb,
+                    int w, int h, int r)
+{
+	const int x = blockIdx.x * CANNY_BW + threadIdx.x;
+	const int y = blockIdx.y * CANNY_BH + threadIdx.y;
+
+	if (x < w && y < h)
+		hb[(size_t)y * w + x] = canny_blur_h(img, w, x, y, c_weights, r);
+}
+
+/**
+ * @brief Vertical Gaussian pass, one thread per pixel.
+ */
+__global__ void
+canny_blur_v_kernel(const int *__restrict__ hb, int *__restrict__ b, int w, int h, int r)
+{
+	const int x = blockIdx.x * CANNY_BW + threadIdx.x;
+	const int y = blockIdx.y * CANNY_BH + threadIdx.y;
+
+	if (x < w && y < h)
+		b[(size_t)y * w + x] = canny_blur_v(hb, 0, w, h, x, y, c_weights, r);
+}
+
+/**
+ * @brief Gradients, non-maximum suppression and thresholds, one thread per
+ *        pixel: the class map (none / weak / edge).
+ */
+__global__ void
+canny_classify_kernel(const int *__restrict__ b, unsigned char *__restrict__ map,
+                      int w, int h, long long tl2, long long th2)
+{
+	const int x = blockIdx.x * CANNY_BW + threadIdx.x;
+	const int y = blockIdx.y * CANNY_BH + threadIdx.y;
+
+	if (x < w && y < h)
+		map[(size_t)y * w + x] = canny_classify(b, 0, w, h, x, y, tl2, th2);
+}
+
+/**
+ * @brief Hysteresis step for tile position (r, c) (1-based inside the halo):
+ *        a weak pixel next to an edge becomes an edge.
+ *
+ * @return 1 if the pixel changed.
+ */
+__host__ __device__ static inline int
+hyst_relax(unsigned char s[HYST_T + 2][HYST_T + 2], int r, int c)
+{
+	if (s[r][c] != CANNY_WEAK)
+		return 0;
+
+	for (int dy = -1; dy <= 1; dy++)
+		for (int dx = -1; dx <= 1; dx++)
+			if (s[r + dy][c + dx] == CANNY_EDGE) {
+				s[r][c] = CANNY_EDGE;
+				return 1;
+			}
+
+	return 0;
+}
+
+/*
+ * Which of a tile's border pixels changed, as bits: a change on a side of
+ * the tile can affect the neighboring tile on that side, a change in a
+ * corner pixel also the diagonal neighbor. Changes inside affect no one.
+ */
+#define BORDER_TOP    0x01
+#define BORDER_BOTTOM 0x02
+#define BORDER_LEFT   0x04
+#define BORDER_RIGHT  0x08
+#define BORDER_TL     0x10
+#define BORDER_TR     0x20
+#define BORDER_BL     0x40
+#define BORDER_BR     0x80
+
+/**
+ * @brief Border bits of tile position (r, c) (1-based inside the halo).
+ */
+__host__ __device__ static inline int
+hyst_border_bits(int r, int c)
+{
+	int bits = 0;
+
+	if (r == 1)      bits |= BORDER_TOP;
+	if (r == HYST_T) bits |= BORDER_BOTTOM;
+	if (c == 1)      bits |= BORDER_LEFT;
+	if (c == HYST_T) bits |= BORDER_RIGHT;
+	if (r == 1 && c == 1)           bits |= BORDER_TL;
+	if (r == 1 && c == HYST_T)      bits |= BORDER_TR;
+	if (r == HYST_T && c == 1)      bits |= BORDER_BL;
+	if (r == HYST_T && c == HYST_T) bits |= BORDER_BR;
+	return bits;
+}
+
+/**
+ * @brief Marks the neighbors of tile (bx, by) that its changed border
+ *        pixels (@p bits) can affect, for the next launch.
+ */
+__host__ __device__ static inline void
+hyst_mark(unsigned char *next, int tiles_x, int tiles_y, int bx, int by, int bits)
+{
+	const int up = by > 0, down = by + 1 < tiles_y, left = bx > 0, right = bx + 1 < tiles_x;
+
+	if ((bits & BORDER_TOP) && up)             next[(by - 1) * tiles_x + bx] = 1;
+	if ((bits & BORDER_BOTTOM) && down)        next[(by + 1) * tiles_x + bx] = 1;
+	if ((bits & BORDER_LEFT) && left)          next[by * tiles_x + bx - 1] = 1;
+	if ((bits & BORDER_RIGHT) && right)        next[by * tiles_x + bx + 1] = 1;
+	if ((bits & BORDER_TL) && up && left)      next[(by - 1) * tiles_x + bx - 1] = 1;
+	if ((bits & BORDER_TR) && up && right)     next[(by - 1) * tiles_x + bx + 1] = 1;
+	if ((bits & BORDER_BL) && down && left)    next[(by + 1) * tiles_x + bx - 1] = 1;
+	if ((bits & BORDER_BR) && down && right)   next[(by + 1) * tiles_x + bx + 1] = 1;
+}
+
+/**
+ * @brief Hysteresis: propagates edges through weak pixels within each
+ *        active tile until nothing changes.
+ *
+ * Only tiles marked in @p active do any work; the others return at once.
+ * A tile that changed pixels on its border marks the neighbors those
+ * pixels touch in @p next, the tiles to process in the next launch: a tile
+ * can only have work left if a neighbor changed their shared border since
+ * it last ran. The tile's 1-pixel border comes from the neighboring tiles
+ * as they were when loaded; a neighbor changing it later in the same launch
+ * marks the tile for the next one. The host relaunches until a launch
+ * changes nothing, which is the unique fixed point: every weak pixel
+ * connected to an edge is an edge, the same result as the CPU's flood fill.
+ *
+ * @param map       Class map (none / weak / edge), updated in place.
+ * @param active    Tiles to process in this launch.
+ * @param next      Tiles to process in the next launch (zeroed by the host).
+ * @param changed   Set to 1 if any pixel changed (may be NULL).
+ * @param processed Count of tiles processed (atomically incremented).
+ */
+__global__ void
+canny_hyst_kernel(unsigned char *__restrict__ map, int w, int h,
+                  const unsigned char *__restrict__ active, unsigned char *__restrict__ next,
+                  int tiles_x, int tiles_y, int *__restrict__ changed, int *__restrict__ processed)
+{
+	__shared__ unsigned char s[HYST_T + 2][HYST_T + 2];
+	__shared__ int border;
+	const int bx = blockIdx.x, by = blockIdx.y;
+	const int tx = threadIdx.x, ty = threadIdx.y;
+	const int tid = ty * HYST_T + tx, nt = HYST_T * HYST_ROWS;
+	const int x0 = bx * HYST_T - 1, y0 = by * HYST_T - 1;
+	unsigned int mask = 0;
+	int any = 0;
+
+	/* the whole block decides together: no barrier has been reached yet */
+	if (!active[by * tiles_x + bx])
+		return;
+
+	if (tid == 0) {
+		border = 0;
+		atomicAdd(processed, 1);
+	}
+
+	for (int i = tid; i < (HYST_T + 2) * (HYST_T + 2); i += nt) {
+		const int r = i / (HYST_T + 2), c = i % (HYST_T + 2);
+		const int gx = x0 + c, gy = y0 + r;
+
+		s[r][c] = (gx >= 0 && gy >= 0 && gx < w && gy < h) ? map[(size_t)gy * w + gx] : CANNY_NONE;
+	}
+	__syncthreads();
+
+	for (;;) {
+		int ch = 0;
+
+		for (int k = 0; k < HYST_T / HYST_ROWS; k++)
+			if (hyst_relax(s, ty + k * HYST_ROWS + 1, tx + 1)) {
+				mask |= 1u << k;
+				ch = 1;
+			}
+
+		/* barrier that also tells every thread whether anyone changed */
+		if (!__syncthreads_or(ch))
+			break;
+		any = 1;
+	}
+
+	/* write back the pixels that changed, noting changed border pixels */
+	for (int k = 0; k < HYST_T / HYST_ROWS; k++) {
+		const int r = ty + k * HYST_ROWS + 1, c = tx + 1;
+		int bits;
+
+		if (!(mask & (1u << k)))
+			continue;
+
+		map[(size_t)(y0 + r) * w + (x0 + c)] = CANNY_EDGE;
+		bits = hyst_border_bits(r, c);
+		if (bits)
+			atomicOr(&border, bits);
+	}
+	__syncthreads();
+
+	if (tid == 0) {
+		if (any && changed)
+			*changed = 1;
+		hyst_mark(next, tiles_x, tiles_y, bx, by, border);
+	}
+}
+
+/**
+ * @brief Class map to edge map in place: 255 on edges, 0 elsewhere.
+ */
+__global__ void
+canny_finish_kernel(unsigned char *__restrict__ map, size_t n)
+{
+	const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i < n)
+		map[i] = (map[i] == CANNY_EDGE) ? 255 : 0;
+}
+
+/* ------------------------------------------------------------------------- */
 /*                              Device Buffers                               */
 /* ------------------------------------------------------------------------- */
 
@@ -372,9 +606,24 @@ static unsigned char *d_pad = NULL, *d_out = NULL;
 static float *d_tab = NULL;
 static size_t cap_pad = 0, cap_out = 0, cap_tab = 0;
 
-/* Events bracketing upload, kernel and download of one image */
-static cudaEvent_t ev[4];
+/* Edge detection buffers */
+static unsigned char *e_img = NULL, *e_map = NULL, *e_act[2] = { NULL, NULL };
+static int *e_hb = NULL, *e_b = NULL, *e_flag = NULL;
+static size_t cap_eimg = 0, cap_emap = 0, cap_ehb = 0, cap_eb = 0, cap_eflag = 0;
+static size_t cap_eact[2] = { 0, 0 };
+
+/* Events bracketing the steps of one image */
+#define NEV 5
+static cudaEvent_t ev[NEV];
 static int ev_ready = 0;
+
+/*
+ * Hysteresis launches per check of the "changed" flag. Reading the flag is
+ * a synchronization with the GPU; launching a few kernels back to back and
+ * checking only the last one saves most of them. Extra launches after the
+ * fixed point is reached change nothing.
+ */
+#define HYST_GROUP 4
 
 /**
  * @brief Reports a CUDA error. Returns 1 if @p err is an error.
@@ -443,7 +692,7 @@ gpu_init(GpuInfo *info)
 		return 1;
 
 	/* blocking-sync events: waiting for them sleeps instead of spinning */
-	for (int i = 0; i < 4; i++)
+	for (int i = 0; i < NEV; i++)
 		if (cuda_failed(cudaEventCreateWithFlags(&ev[i], cudaEventBlockingSync), "cudaEventCreate"))
 			return 1;
 	ev_ready = 1;
@@ -474,8 +723,20 @@ gpu_shutdown(void)
 	d_tab = NULL;
 	cap_pad = cap_out = cap_tab = 0;
 
+	cudaFree(e_img);
+	cudaFree(e_map);
+	cudaFree(e_hb);
+	cudaFree(e_b);
+	cudaFree(e_flag);
+	cudaFree(e_act[0]);
+	cudaFree(e_act[1]);
+	e_img = e_map = e_act[0] = e_act[1] = NULL;
+	e_hb = e_b = e_flag = NULL;
+	cap_eimg = cap_emap = cap_ehb = cap_eb = cap_eflag = 0;
+	cap_eact[0] = cap_eact[1] = 0;
+
 	if (ev_ready)
-		for (int i = 0; i < 4; i++)
+		for (int i = 0; i < NEV; i++)
 			cudaEventDestroy(ev[i]);
 	ev_ready = 0;
 }
@@ -489,14 +750,18 @@ gpu_shutdown(void)
  *
  * @note Not thread-safe: call from one thread (the pipeline's GPU thread).
  *
+ * With @p keep set, the result is left on the GPU for gpu_edges() instead
+ * of being downloaded (the job's output buffer is then not filled).
+ *
  * @param[in,out] job    Job prepared with nlm_job_prepare().
- * @param[in,out] timing GPU time of the three steps, added to (may be NULL).
+ * @param[in,out] timing GPU time of the steps, added to (may be NULL).
+ * @param[in]     keep   Non-zero to keep the result on the GPU.
  *
  * @return IMG_OK, IMG_ERR_UNSUPPORTED if the job has no weight table, or
  *         IMG_ERR_GPU on a CUDA error (already reported).
  */
 extern "C" int
-gpu_denoise(NlmJob *job, GpuTiming *timing)
+gpu_denoise(NlmJob *job, GpuTiming *timing, int keep)
 {
 	const NlmContext *c = &job->ctx;
 	const int r = c->p + c->s;
@@ -545,9 +810,12 @@ gpu_denoise(NlmJob *job, GpuTiming *timing)
 
 	cudaEventRecord(ev[2]);
 
-	if (cuda_failed(err, "kernel launch")
-	    || cuda_failed(cudaMemcpy(job->out.data, d_out, nout, cudaMemcpyDeviceToHost),
-	                   "download (output)"))
+	if (cuda_failed(err, "kernel launch"))
+		return IMG_ERR_GPU;
+
+	/* kept on the GPU for edge detection: no download */
+	if (!keep && cuda_failed(cudaMemcpy(job->out.data, d_out, nout, cudaMemcpyDeviceToHost),
+	                         "download (output)"))
 		return IMG_ERR_GPU;
 
 	cudaEventRecord(ev[3]);
@@ -562,8 +830,143 @@ gpu_denoise(NlmJob *job, GpuTiming *timing)
 		cudaEventElapsedTime(&kern, ev[1], ev[2]);
 		cudaEventElapsedTime(&down, ev[2], ev[3]);
 		timing->upload_s += up / 1000.0;
-		timing->kernel_s += kern / 1000.0;
+		timing->denoise_s += kern / 1000.0;
 		timing->download_s += down / 1000.0;
+	}
+
+	return IMG_OK;
+}
+
+/**
+ * @brief Detects the edges of an image on the GPU, replacing it with the
+ *        edge map (255 on edges, 0 elsewhere).
+ *
+ * Uploads the image (or, with @p on_gpu set, uses the result gpu_denoise()
+ * kept on the GPU), runs the blur, gradient/suppression and hysteresis
+ * kernels, and downloads the edge map into the image's buffer. The result
+ * is identical to the CPU's (canny_band() and canny_hysteresis()).
+ *
+ * @note Not thread-safe: call from one thread (the pipeline's GPU thread).
+ *
+ * @param[in,out] img    Image (its pixels are not read when @p on_gpu is set).
+ * @param[in]     s      Setup from canny_setup().
+ * @param[in,out] timing GPU time of the steps, added to (may be NULL).
+ * @param[in]     on_gpu Non-zero to use the denoised image kept on the GPU.
+ *
+ * @return IMG_OK, or IMG_ERR_GPU on a CUDA error (already reported).
+ */
+extern "C" int
+gpu_edges(Image *img, const CannySetup *s, GpuTiming *timing, int on_gpu)
+{
+	const int w = (int)img->width, h = (int)img->height;
+	const size_t n = (size_t)w * h;
+	dim3 block(CANNY_BW, CANNY_BH);
+	dim3 grid((unsigned)((w + CANNY_BW - 1) / CANNY_BW), (unsigned)((h + CANNY_BH - 1) / CANNY_BH));
+	dim3 hblock(HYST_T, HYST_ROWS);
+	dim3 hgrid((unsigned)((w + HYST_T - 1) / HYST_T), (unsigned)((h + HYST_T - 1) / HYST_T));
+	const int ntiles = (int)(hgrid.x * hgrid.y);
+	const unsigned char *src;
+	int flag, launches = 0, cur = 0, counts[2];
+
+	/* e_flag holds the "changed" flag and the processed-tiles counter */
+	if (reserve((void **)&e_img, &cap_eimg, n, "cudaMalloc (edges image)")
+	    || reserve((void **)&e_map, &cap_emap, n, "cudaMalloc (edges map)")
+	    || reserve((void **)&e_hb, &cap_ehb, n * sizeof(int), "cudaMalloc (edges blur)")
+	    || reserve((void **)&e_b, &cap_eb, n * sizeof(int), "cudaMalloc (edges blur)")
+	    || reserve((void **)&e_flag, &cap_eflag, 2 * sizeof(int), "cudaMalloc (edges flag)")
+	    || reserve((void **)&e_act[0], &cap_eact[0], (size_t)ntiles, "cudaMalloc (active tiles)")
+	    || reserve((void **)&e_act[1], &cap_eact[1], (size_t)ntiles, "cudaMalloc (active tiles)"))
+		return IMG_ERR_GPU;
+
+	if (cuda_failed(cudaMemcpyToSymbol(c_weights, s->weights, sizeof(int) * (2 * s->radius + 1)),
+	                "upload (Gaussian weights)"))
+		return IMG_ERR_GPU;
+
+	cudaEventRecord(ev[0]);
+
+	/* the denoised image is already on the GPU, in the denoising output */
+	if (on_gpu) {
+		src = d_out;
+	} else {
+		if (cuda_failed(cudaMemcpy(e_img, img->data, n, cudaMemcpyHostToDevice), "upload (edges image)"))
+			return IMG_ERR_GPU;
+		src = e_img;
+	}
+
+	cudaEventRecord(ev[1]);
+
+	canny_blur_h_kernel<<<grid, block>>>(src, e_hb, w, h, s->radius);
+	canny_blur_v_kernel<<<grid, block>>>(e_hb, e_b, w, h, s->radius);
+	canny_classify_kernel<<<grid, block>>>(e_b, e_map, w, h, s->low2, s->high2);
+	if (cuda_failed(cudaGetLastError(), "edge kernels"))
+		return IMG_ERR_GPU;
+
+	cudaEventRecord(ev[2]);
+
+	/*
+	 * Hysteresis: relaunch until a launch changes nothing, processing only
+	 * the active tiles: all of them at first, then those whose neighbors
+	 * changed their shared border. The flag is only checked on every
+	 * HYST_GROUP-th launch (each check waits for the GPU); launches after
+	 * convergence find no active tile and cost almost nothing.
+	 */
+	if (cuda_failed(cudaMemsetAsync(e_act[0], 1, (size_t)ntiles), "cudaMemset (active tiles)")
+	    || cuda_failed(cudaMemsetAsync(e_flag, 0, 2 * sizeof(int)), "cudaMemset (edges flag)"))
+		return IMG_ERR_GPU;
+
+	do {
+		for (int k = 0; k < HYST_GROUP; k++) {
+			const int last = (k == HYST_GROUP - 1);
+
+			cudaMemsetAsync(e_act[1 - cur], 0, (size_t)ntiles);
+			if (last)
+				cudaMemsetAsync(e_flag, 0, sizeof(int));
+
+			canny_hyst_kernel<<<hgrid, hblock>>>(e_map, w, h, e_act[cur], e_act[1 - cur],
+			                                     (int)hgrid.x, (int)hgrid.y,
+			                                     last ? e_flag : NULL, e_flag + 1);
+			cur = 1 - cur;
+		}
+		launches += HYST_GROUP;
+
+		if (cuda_failed(cudaGetLastError(), "hysteresis kernel")
+		    || cuda_failed(cudaMemcpy(&flag, e_flag, sizeof(int), cudaMemcpyDeviceToHost),
+		                   "download (edges flag)"))
+			return IMG_ERR_GPU;
+	} while (flag);
+
+	if (cuda_failed(cudaMemcpy(counts, e_flag, 2 * sizeof(int), cudaMemcpyDeviceToHost),
+	                "download (tile count)"))
+		return IMG_ERR_GPU;
+
+	canny_finish_kernel<<<(unsigned)((n + 255) / 256), 256>>>(e_map, n);
+	if (cuda_failed(cudaGetLastError(), "edge map kernel"))
+		return IMG_ERR_GPU;
+
+	cudaEventRecord(ev[3]);
+
+	if (cuda_failed(cudaMemcpy(img->data, e_map, n, cudaMemcpyDeviceToHost), "download (edge map)"))
+		return IMG_ERR_GPU;
+
+	cudaEventRecord(ev[4]);
+
+	if (timing) {
+		float up = 0.0f, pix = 0.0f, hyst = 0.0f, down = 0.0f;
+
+		if (cuda_failed(cudaEventSynchronize(ev[4]), "cudaEventSynchronize"))
+			return IMG_ERR_GPU;
+
+		cudaEventElapsedTime(&up, ev[0], ev[1]);
+		cudaEventElapsedTime(&pix, ev[1], ev[2]);
+		cudaEventElapsedTime(&hyst, ev[2], ev[3]);
+		cudaEventElapsedTime(&down, ev[3], ev[4]);
+		timing->upload_s += up / 1000.0;
+		timing->edges_s += (pix + hyst) / 1000.0;
+		timing->hysteresis_s += hyst / 1000.0;
+		timing->download_s += down / 1000.0;
+		timing->launches += launches;
+		timing->tiles += counts[1];
+		timing->tiles_all += (double)launches * ntiles;
 	}
 
 	return IMG_OK;

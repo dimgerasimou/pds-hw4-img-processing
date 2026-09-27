@@ -65,6 +65,19 @@ void print_dataset_info(FILE *f, const DatasetInfo *info, const unsigned int ind
 void print_denoise_info(FILE *f, const DenoiseInfo *info, const unsigned int indent_level);
 
 /**
+ * @brief Print the edge detection configuration as formatted JSON.
+ *
+ * Outputs `"edges": null` if the stage is disabled, otherwise the device and
+ * the detector parameters (with the Gaussian radius used).
+ *
+ * @param[in] f            Output stream.
+ * @param[in] cfg          Pointer to EdgesConfig structure to print.
+ * @param[in] gpu          Non-zero if the filters ran on the GPU.
+ * @param[in] indent_level Number of spaces to indent the output.
+ */
+void print_edges_info(FILE *f, const EdgesConfig *cfg, int gpu, const unsigned int indent_level);
+
+/**
  * @brief Print a timing summary as formatted JSON.
  *
  * Outputs `"<name>": { mean, std_dev, median, min, max, total }`.

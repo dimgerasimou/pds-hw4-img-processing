@@ -33,7 +33,7 @@ enum {
 
 /* Stage names, indexed by STAGE_* */
 static const char *stage_names[STAGE_COUNT] = {
-	"read", "decode", "denoise", "encode", "write"
+	"read", "decode", "denoise", "edges", "encode", "write"
 };
 
 /*
@@ -637,10 +637,25 @@ skip(ImageItem *it, int stage, size_t units)
 /**
  * @brief Checks whether an image holds valid pixels after the pixel stages.
  *
- * Denoising is optional: when it did not run, the decoded pixels are used.
+ * Denoising and edge detection are optional: the pixels come from the last
+ * of decode, denoise and edges that is enabled.
  */
 static int
 pixels_ok(const ImageSet *set, const ImageItem *it)
+{
+	if (set->edges.enabled)
+		return it->err[STAGE_EDGES] == IMG_OK;
+	if (set->denoise.enabled)
+		return it->err[STAGE_DENOISE] == IMG_OK;
+	return it->err[STAGE_DECODE] == IMG_OK;
+}
+
+/**
+ * @brief Checks whether an image holds valid pixels for edge detection:
+ *        denoised if denoising is enabled, decoded otherwise.
+ */
+static int
+edges_input_ok(const ImageSet *set, const ImageItem *it)
 {
 	if (set->denoise.enabled)
 		return it->err[STAGE_DENOISE] == IMG_OK;
@@ -657,6 +672,7 @@ eligible(const ImageSet *set, const ImageItem *it, int stage)
 	case STAGE_READ:    return 1;
 	case STAGE_DECODE:  return it->err[STAGE_READ] == IMG_OK;
 	case STAGE_DENOISE: return set->denoise.enabled && it->err[STAGE_DECODE] == IMG_OK;
+	case STAGE_EDGES:   return set->edges.enabled && edges_input_ok(set, it);
 	case STAGE_ENCODE:  return it->out_path && pixels_ok(set, it);
 	case STAGE_WRITE:   return it->err[STAGE_ENCODE] == IMG_OK;
 	default:            return 0;
@@ -963,6 +979,10 @@ report_failures(const ImageSet *set, int stage, size_t first, size_t last)
 			uerrf("cannot denoise \"%s\": %s", it->in_path,
 			      image_strerror(e, 0));
 			break;
+		case STAGE_EDGES:
+			uerrf("cannot detect edges of \"%s\": %s", it->in_path,
+			      image_strerror(e, 0));
+			break;
 		case STAGE_DECODE:
 			if (it->detail)
 				uerrf("cannot decode \"%s\": %s (%s)", it->in_path,
@@ -1116,6 +1136,172 @@ fail_quiet:
 	return 1;
 }
 
+/*
+ * Band height for edge detection: about EDGE_BANDS_PER_THREAD bands per
+ * thread over the batch, within [EDGE_MIN_ROWS, EDGE_MAX_ROWS]. Every band
+ * recomputes 4 + 2 * (Gaussian radius) border rows of blur, so bands should
+ * not be too small.
+ */
+#define EDGE_BANDS_PER_THREAD 4
+#define EDGE_MIN_ROWS         16
+#define EDGE_MAX_ROWS         64
+
+/**
+ * @brief Edge detection stage over the images [first, last).
+ *
+ * Like denoising: the bands of all images of the batch form one pool,
+ * handed out to the threads dynamically, bands of wider images first. Each
+ * band is classified with the thread's own small buffers (canny_band()).
+ * The thread that completes the last band of an image runs its hysteresis
+ * right away, so hysteresis overlaps with the other images' bands instead
+ * of forming a separate phase. The class map is a separate buffer, since
+ * other bands still read the image; it replaces the image once complete.
+ *
+ * An image's recorded time is the thread time spent on it (its bands plus
+ * its hysteresis).
+ *
+ * @return Number of images that failed.
+ */
+static size_t
+edges_bands(ImageSet *set, size_t first, size_t last, Progress *progress)
+{
+	const CannySetup *cs = &set->edges.setup;
+	const size_t n = last - first;
+	const long threads = omp_get_max_threads();
+	unsigned char **maps = calloc(n ? n : 1, sizeof(unsigned char *));
+	BandOrder *order = malloc((n ? n : 1) * sizeof(BandOrder));
+	long *start = malloc((n + 1) * sizeof(long));
+	long *left = calloc(n ? n : 1, sizeof(long));
+	long rows = 0, band, total;
+	unsigned int maxw = 0;
+	size_t failed = 0, m = 0;
+	int nomem = 0;
+
+	if (!maps || !order || !start || !left) {
+		DERRNOF("allocation failed");
+		free(maps); free(order); free(start); free(left);
+		for (size_t i = first; i < last; i++) {
+			ImageItem *it = &set->items[i];
+			it->err[STAGE_EDGES] = eligible(set, it, STAGE_EDGES) ? IMG_ERR_NOMEM : IO_NOT_DONE;
+			failed += (it->err[STAGE_EDGES] == IMG_ERR_NOMEM);
+			progress_add(progress, 1);
+		}
+		return failed;
+	}
+
+	/* eligible images, their class maps, and the band height */
+	for (size_t k = 0; k < n; k++) {
+		ImageItem *it = &set->items[first + k];
+
+		if (!eligible(set, it, STAGE_EDGES)) {
+			it->err[STAGE_EDGES] = IO_NOT_DONE;
+			progress_add(progress, 1);
+			continue;
+		}
+
+		it->bytes[STAGE_EDGES] = image_bytes(&it->img);
+		it->time_s[STAGE_EDGES] = 0.0;
+		maps[k] = malloc(image_bytes(&it->img));
+		if (!maps[k]) {
+			it->err[STAGE_EDGES] = IMG_ERR_NOMEM;
+			failed++;
+			progress_add(progress, 1);
+			continue;
+		}
+
+		it->err[STAGE_EDGES] = IO_NOT_DONE; /* until its hysteresis is done */
+		rows += (long)it->img.height;
+		if (it->img.width > maxw)
+			maxw = it->img.width;
+		order[m].k = k;
+		order[m].width = it->img.width;
+		m++;
+	}
+
+	band = rows / (EDGE_BANDS_PER_THREAD * threads);
+	band = band < EDGE_MIN_ROWS ? EDGE_MIN_ROWS : band > EDGE_MAX_ROWS ? EDGE_MAX_ROWS : band;
+
+	/* global band numbering, wider images first */
+	qsort(order, m, sizeof(BandOrder), cmp_band_order);
+
+	start[0] = 0;
+	for (size_t j = 0; j < m; j++) {
+		const ImageItem *it = &set->items[first + order[j].k];
+		left[j] = ((long)it->img.height + band - 1) / band;
+		start[j + 1] = start[j] + left[j];
+	}
+	total = start[m];
+
+	#pragma omp parallel reduction(+:failed)
+	{
+		CannyScratch *sc = total > 0 ? canny_scratch_new((int)maxw, (int)band, cs->radius) : NULL;
+
+		if (total > 0 && !sc) {
+			#pragma omp atomic write
+			nomem = 1;
+		}
+
+		#pragma omp for schedule(dynamic)
+		for (long g = 0; g < total; g++) {
+			const size_t j = find_job(start, m, g);
+			const size_t k = order[j].k;
+			ImageItem *it = &set->items[first + k];
+			const long y0 = (g - start[j]) * band;
+			const long y1 = (y0 + band < (long)it->img.height) ? y0 + band : (long)it->img.height;
+			double ts = omp_get_wtime(), dt;
+			long rem;
+
+			if (!sc)
+				continue;
+
+			canny_band(&it->img, cs, (int)y0, (int)y1, maps[k], sc);
+
+			#pragma omp atomic capture
+			rem = --left[j];
+
+			/* last band of the image: hysteresis, then the image becomes the edge map */
+			if (rem == 0) {
+				int r = canny_hysteresis(maps[k], (int)it->img.width, (int)it->img.height);
+
+				if (r == IMG_OK) {
+					free(it->img.data);
+					it->img.data = maps[k];
+					maps[k] = NULL;
+				} else {
+					failed++;
+				}
+				it->err[STAGE_EDGES] = r;
+				progress_add(progress, 1);
+			}
+
+			dt = omp_get_wtime() - ts;
+			#pragma omp atomic
+			it->time_s[STAGE_EDGES] += dt;
+		}
+
+		canny_scratch_free(sc);
+	}
+
+	/* images whose bands never ran (no scratch memory) */
+	for (size_t j = 0; j < m; j++) {
+		ImageItem *it = &set->items[first + order[j].k];
+
+		if (left[j] > 0 && nomem) {
+			it->err[STAGE_EDGES] = IMG_ERR_NOMEM;
+			failed++;
+			progress_add(progress, 1);
+		}
+	}
+
+	for (size_t k = 0; k < n; k++)
+		free(maps[k]);
+	free(maps);
+	free(order);
+	free(start);
+	free(left);
+	return failed;
+}
+
 /**
  * @brief Runs one stage over the eligible images of a range, in parallel.
  *
@@ -1161,6 +1347,11 @@ io_run(ImageSet *set, int stage, size_t first, size_t last, Progress *progress)
 	if (stage == STAGE_DENOISE) {
 		assign_units(set, first, last);
 		failed = denoise_bands(set, first, last, progress);
+		goto done;
+	}
+
+	if (stage == STAGE_EDGES) {
+		failed = edges_bands(set, first, last, progress);
 		goto done;
 	}
 
@@ -1211,7 +1402,7 @@ done:
  * Computes, for every image, the noise estimate, the mirrored padding and
  * the weight table (nlm_job_prepare()), in parallel over the images (or,
  * with fewer images than threads, one image at a time with all threads).
- * The prepared jobs are kept in the items for io_gpu_denoise().
+ * The prepared jobs are kept in the items for io_gpu_filter().
  *
  * @param[in,out] set      Image set (denoising must be enabled).
  * @param[in]     first    First image of the range.
@@ -1286,66 +1477,98 @@ cpu_fallback(NlmJob *job, unsigned int width, unsigned int patch)
 }
 
 /**
- * @brief GPU denoising, GPU part: denoises the prepared images of a range.
+ * @brief GPU filters: denoises and/or detects the edges of a range.
  *
- * Runs every image prepared by io_prepare() through the GPU, one after the
- * other, and replaces its pixels with the result. An image whose parameters
- * exceed the GPU's weight table limit is denoised on the CPU instead. Meant
- * to run on its own thread while the CPU stages work on other batches.
+ * Runs every image through the enabled filters on the GPU, one image after
+ * the other: denoising for the images prepared by io_prepare(), then edge
+ * detection. An image whose denoising parameters exceed the GPU's limits is
+ * denoised on the CPU instead. Meant to run on its own thread while the CPU
+ * stages work on other batches.
  *
  * @param[in,out] set      Image set.
  * @param[in]     first    First image of the range.
  * @param[in]     last     One past the last image of the range.
- * @param[in,out] progress Progress bar (advanced per image).
+ * @param[in,out] progress Progress bar (advanced per image and filter).
  *
- * @return Number of images that failed.
+ * @return Number of stage failures.
  */
 size_t
-io_gpu_denoise(ImageSet *set, size_t first, size_t last, Progress *progress)
+io_gpu_filter(ImageSet *set, size_t first, size_t last, Progress *progress)
 {
-	size_t failed = 0;
-	double t0 = omp_get_wtime();
+	size_t failed_dn = 0, failed_ed = 0;
+	double wall_dn = 0.0, wall_ed = 0.0;
 
 	if (last > set->count)
 		last = set->count;
 
 	for (size_t i = first; i < last; i++) {
 		ImageItem *it = &set->items[i];
+		int on_gpu = 0;
 		double ts;
 		Image out;
 		int r;
 
-		/* skipped or failed at preparation: already accounted for */
-		if (it->err[STAGE_DENOISE] != IMG_OK)
-			continue;
+		/* denoising: images prepared by io_prepare() (others already accounted for) */
+		if (set->denoise.enabled && it->err[STAGE_DENOISE] == IMG_OK) {
+			ts = omp_get_wtime();
 
-		ts = omp_get_wtime();
-		r = gpu_denoise(&it->job, &set->gpu_time);
-		if (r == IMG_ERR_UNSUPPORTED)
-			r = cpu_fallback(&it->job, it->img.width, set->denoise.params.patch);
+			/* followed by edge detection: keep the result on the GPU */
+			r = gpu_denoise(&it->job, &set->gpu_time, set->edges.enabled);
+			on_gpu = (r == IMG_OK && set->edges.enabled);
+			if (r == IMG_ERR_UNSUPPORTED)
+				r = cpu_fallback(&it->job, it->img.width, set->denoise.params.patch);
 
-		if (r == IMG_OK) {
-			nlm_job_finish(&it->job, &out);
-			image_free(&it->img);
-			it->img = out;
-		} else {
-			nlm_job_discard(&it->job);
-			failed++;
+			if (r == IMG_OK) {
+				nlm_job_finish(&it->job, &out);
+				image_free(&it->img);
+				it->img = out;
+			} else {
+				nlm_job_discard(&it->job);
+				failed_dn++;
+			}
+
+			ts = omp_get_wtime() - ts;
+			it->time_s[STAGE_DENOISE] += ts;
+			wall_dn += ts;
+			it->err[STAGE_DENOISE] = r;
+			progress_add(progress, it->units);
 		}
 
-		it->time_s[STAGE_DENOISE] += omp_get_wtime() - ts;
-		it->err[STAGE_DENOISE] = r;
-		progress_add(progress, it->units);
+		/* edge detection, on the denoised or decoded pixels */
+		if (set->edges.enabled) {
+			if (!eligible(set, it, STAGE_EDGES)) {
+				it->err[STAGE_EDGES] = IO_NOT_DONE;
+				progress_add(progress, 1);
+				continue;
+			}
+
+			it->bytes[STAGE_EDGES] = image_bytes(&it->img);
+			ts = omp_get_wtime();
+			r = gpu_edges(&it->img, &set->edges.setup, &set->gpu_time, on_gpu);
+			ts = omp_get_wtime() - ts;
+
+			it->time_s[STAGE_EDGES] = ts;
+			wall_ed += ts;
+			it->err[STAGE_EDGES] = r;
+			failed_ed += (r != IMG_OK);
+			progress_add(progress, 1);
+		}
 	}
 
-	stage_done(set, STAGE_DENOISE, omp_get_wtime() - t0);
+	if (set->denoise.enabled)
+		stage_done(set, STAGE_DENOISE, wall_dn);
+	if (set->edges.enabled)
+		stage_done(set, STAGE_EDGES, wall_ed);
 
-	if (failed && !set->quiet) {
+	if ((failed_dn || failed_ed) && !set->quiet) {
 		progress_clear(progress);
-		report_failures(set, STAGE_DENOISE, first, last);
+		if (failed_dn)
+			report_failures(set, STAGE_DENOISE, first, last);
+		if (failed_ed)
+			report_failures(set, STAGE_EDGES, first, last);
 	}
 
-	return failed;
+	return failed_dn + failed_ed;
 }
 
 /**
@@ -1412,9 +1635,9 @@ io_reset(ImageSet *set)
 /**
  * @brief Progress units of one image over the stages that will run.
  *
- * Every I/O and codec stage counts 1 unit per image, and denoising counts
- * nlm_units() (the number of search offsets, 440 with the defaults), which
- * reflects that it dominates the run time.
+ * Every I/O and codec stage, and edge detection, counts 1 unit per image,
+ * and denoising counts nlm_units() (the number of search offsets, 440 with
+ * the defaults), which reflects that it dominates the run time.
  *
  * @param[in] set   Image set (its denoise configuration is used).
  * @param[in] write Non-zero if the encode and write stages will run.
@@ -1428,6 +1651,8 @@ io_progress_units(const ImageSet *set, int write)
 
 	if (set->denoise.enabled)
 		u += nlm_units(&set->denoise.params);
+	if (set->edges.enabled)
+		u += 1;
 
 	return u;
 }
