@@ -67,7 +67,8 @@ enum {
 	IMG_ERR_SIZE,        /**< Invalid or unsupported image dimensions */
 	IMG_ERR_TRUNC,       /**< Unexpected end of data */
 	IMG_ERR_NOMEM,       /**< Memory allocation failed */
-	IMG_ERR_UNSUPPORTED  /**< Format cannot be written */
+	IMG_ERR_UNSUPPORTED, /**< Format cannot be written / operation not supported */
+	IMG_ERR_GPU          /**< GPU (CUDA) error */
 };
 
 /* ------------------------------------------------------------------------- */

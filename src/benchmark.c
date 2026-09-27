@@ -255,6 +255,9 @@ summarize(Benchmark *b)
 	}
 
 	calcstatistics(b->pipeline, n, &b->pipeline_time);
+
+	for (int k = 0; k < 3; k++)
+		calcstatistics(b->gpu[k], n, &b->gpu_time[k]);
 }
 
 /**
@@ -336,6 +339,12 @@ benchmark_init(const char *input, const char *output, const unsigned int threads
 	if (!b->pipeline)
 		goto fail;
 
+	for (int k = 0; k < 3; k++) {
+		b->gpu[k] = calloc(trials, sizeof(double));
+		if (!b->gpu[k])
+			goto fail;
+	}
+
 	copy_str(b->dataset_info.input_path, sizeof(b->dataset_info.input_path), input);
 	copy_str(b->dataset_info.output_path, sizeof(b->dataset_info.output_path), output);
 
@@ -359,6 +368,23 @@ fail:
 }
 
 /**
+ * @brief Records the GPU used for the run.
+ *
+ * @param[in,out] b    Benchmark structure.
+ * @param[in]     info GPU information.
+ */
+void
+benchmark_set_gpu(Benchmark *b, const GpuInfo *info)
+{
+	if (!b || !info)
+		return;
+
+	b->sys_info.has_gpu = 1;
+	b->sys_info.gpu = *info;
+	b->denoise_info.gpu = 1;
+}
+
+/**
  * @brief Frees a Benchmark structure. Safe to call with NULL.
  *
  * @param[in,out] b Pointer to the Benchmark structure to free.
@@ -374,6 +400,8 @@ benchmark_free(Benchmark *b)
 		free(b->samples[s]);
 	}
 	free(b->pipeline);
+	for (int k = 0; k < 3; k++)
+		free(b->gpu[k]);
 	free(b);
 }
 
@@ -428,6 +456,9 @@ benchmark_trial_end(Benchmark *b, const ImageSet *set)
 
 	t = b->trials_done++;
 	b->pipeline[t] = elapsed;
+	b->gpu[0][t] = set->gpu_time.upload_s;
+	b->gpu[1][t] = set->gpu_time.kernel_s;
+	b->gpu[2][t] = set->gpu_time.download_s;
 
 	for (int s = 0; s < STAGE_COUNT; s++) {
 		StageResult *r = &b->results[s];
@@ -523,6 +554,20 @@ benchmark_write(Benchmark *b, const char *path)
 	fprintf(f, "%*s},\n", JSON_INDENT, "");
 	print_statistics(f, "pipeline_time", &b->pipeline_time, JSON_INDENT);
 	fprintf(f, ",\n");
+
+	/* GPU time per step, over trials, measured by the GPU (CUDA events) */
+	fprintf(f, "%*s\"gpu_time\": ", JSON_INDENT, "");
+	if (!b->denoise_info.gpu) {
+		fputs("null,\n", f);
+	} else {
+		fprintf(f, "{\n");
+		print_statistics(f, "upload", &b->gpu_time[0], JSON_INDENT + 2);
+		fprintf(f, ",\n");
+		print_statistics(f, "kernel", &b->gpu_time[1], JSON_INDENT + 2);
+		fprintf(f, ",\n");
+		print_statistics(f, "download", &b->gpu_time[2], JSON_INDENT + 2);
+		fprintf(f, "\n%*s},\n", JSON_INDENT, "");
+	}
 	print_memory_info(f, &b->memory, JSON_INDENT);
 	fprintf(f, "\n}\n");
 

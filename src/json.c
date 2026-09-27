@@ -56,7 +56,7 @@ json_print_escaped(FILE *f, const char *s)
  * @brief Print system information as formatted JSON.
  *
  * Outputs a JSON object containing the CPU model, logical core count,
- * total RAM, and swap space in gigabytes.
+ * total RAM, swap space in gigabytes, and the GPU used (or null).
  *
  * @param[in] f            Output stream.
  * @param[in] info         Pointer to SystemInfo structure to print.
@@ -71,7 +71,24 @@ print_sys_info(FILE *f, const SystemInfo *info, const unsigned int indent_level)
 	fprintf(f, ",\n");
 	fprintf(f, "%*s\"cpu_cores\": %u,\n", indent_level + 2, "", info->cpu_cores);
 	fprintf(f, "%*s\"ram_gb\": %.2f,\n", indent_level + 2, "", info->ram_gb);
-	fprintf(f, "%*s\"swap_gb\": %.2f\n", indent_level + 2, "", info->swap_gb);
+	fprintf(f, "%*s\"swap_gb\": %.2f,\n", indent_level + 2, "", info->swap_gb);
+
+	fprintf(f, "%*s\"gpu\": ", indent_level + 2, "");
+	if (!info->has_gpu) {
+		fputs("null\n", f);
+	} else {
+		fprintf(f, "{\n");
+		fprintf(f, "%*s\"name\": ", indent_level + 4, "");
+		json_print_escaped(f, info->gpu.name);
+		fprintf(f, ",\n");
+		fprintf(f, "%*s\"compute_capability\": \"%d.%d\",\n", indent_level + 4, "",
+		        info->gpu.cc_major, info->gpu.cc_minor);
+		fprintf(f, "%*s\"multiprocessors\": %d,\n", indent_level + 4, "", info->gpu.sm_count);
+		fprintf(f, "%*s\"memory_gb\": %.2f,\n", indent_level + 4, "", info->gpu.mem_gb);
+		fprintf(f, "%*s\"driver_version\": %d,\n", indent_level + 4, "", info->gpu.driver_version);
+		fprintf(f, "%*s\"runtime_version\": %d\n", indent_level + 4, "", info->gpu.runtime_version);
+		fprintf(f, "%*s}\n", indent_level + 2, "");
+	}
 	fprintf(f, "%*s}", indent_level, "");
 }
 
@@ -164,8 +181,8 @@ print_dataset_info(FILE *f, const DatasetInfo *info, const unsigned int indent_l
  * @brief Print the denoising configuration as formatted JSON.
  *
  * Outputs `"denoise": null` if the stage is disabled, otherwise its
- * parameters, parallelization mode, and the noise standard deviations
- * used (given, or estimated per image).
+ * parameters and the noise standard deviations used (given, or estimated
+ * per image).
  *
  * @param[in] f            Output stream.
  * @param[in] info         Pointer to DenoiseInfo structure to print.
@@ -185,12 +202,7 @@ print_denoise_info(FILE *f, const DenoiseInfo *info, const unsigned int indent_l
 
 	fprintf(f, "{\n");
 	fprintf(f, "%*s\"algorithm\": \"nlm\",\n", indent_level + 2, "");
-	fprintf(f, "%*s\"method\": ", indent_level + 2, "");
-	json_print_escaped(f, nlm_method_name(c->params.method));
-	fprintf(f, ",\n");
-	fprintf(f, "%*s\"mode\": ", indent_level + 2, "");
-	json_print_escaped(f, io_mode_name(c->mode));
-	fprintf(f, ",\n");
+	fprintf(f, "%*s\"device\": \"%s\",\n", indent_level + 2, "", info->gpu ? "cuda" : "cpu");
 	fprintf(f, "%*s\"patch_radius\": %u,\n", indent_level + 2, "", c->params.patch);
 	fprintf(f, "%*s\"search_radius\": %u,\n", indent_level + 2, "", c->params.search);
 	fprintf(f, "%*s\"h_factor\": %.4f,\n", indent_level + 2, "", c->params.h_factor);

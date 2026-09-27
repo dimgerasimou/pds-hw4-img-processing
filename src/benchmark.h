@@ -19,6 +19,7 @@
 
 #include <stddef.h>
 
+#include "gpu.h"
 #include "io.h"
 
 /* ------------------------------------------------------------------------- */
@@ -72,6 +73,8 @@ typedef struct {
 	unsigned int cpu_cores; /**< Logical CPUs online */
 	double ram_gb;          /**< Total system RAM in gigabytes */
 	double swap_gb;         /**< Total swap space in gigabytes */
+	int has_gpu;            /**< Non-zero if the GPU was used */
+	GpuInfo gpu;            /**< GPU information (if has_gpu) */
 } SystemInfo;
 
 /**
@@ -80,6 +83,7 @@ typedef struct {
  */
 typedef struct {
 	DenoiseConfig config; /**< Stage configuration */
+	int gpu;              /**< Non-zero if denoising ran on the GPU */
 	double sigma_mean;    /**< Mean noise standard deviation used */
 	double sigma_min;     /**< Smallest noise standard deviation used */
 	double sigma_max;     /**< Largest noise standard deviation used */
@@ -143,6 +147,7 @@ typedef struct {
 	DenoiseInfo denoise_info;         /**< Denoising configuration and noise */
 	StageResult results[STAGE_COUNT]; /**< Per-stage results */
 	Statistics pipeline_time;         /**< Whole-pipeline time over trials */
+	Statistics gpu_time[3];           /**< GPU upload/kernel/download time over trials */
 	MemoryInfo memory;                /**< Memory usage */
 
 	/* raw samples, internal */
@@ -152,6 +157,7 @@ typedef struct {
 	double *samples[STAGE_COUNT];     /**< Per-image times, all trials */
 	size_t nsamples[STAGE_COUNT];     /**< Number of per-image samples */
 	double *pipeline;                 /**< Whole-pipeline time per trial */
+	double *gpu[3];                   /**< GPU upload/kernel/download time per trial */
 	double trial_start;               /**< Start time of the current trial */
 	long majflt_start;                /**< Major faults at trial start */
 	long minflt_start;                /**< Minor faults at trial start */
@@ -194,6 +200,14 @@ Benchmark* benchmark_init(const char *input, const char *output,
                           const unsigned int wtrials, const size_t batch,
                           const size_t batches, const size_t images,
                           const DenoiseConfig *denoise);
+
+/**
+ * @brief Records the GPU used for the run.
+ *
+ * @param[in,out] b    Benchmark structure.
+ * @param[in]     info GPU information.
+ */
+void benchmark_set_gpu(Benchmark *b, const GpuInfo *info);
 
 /**
  * @brief Frees a Benchmark structure. Safe to call with NULL.

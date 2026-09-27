@@ -18,7 +18,7 @@
  * @brief Print system information as formatted JSON.
  *
  * Outputs a JSON object containing the CPU model, logical core count,
- * total RAM, and swap space in gigabytes.
+ * total RAM, swap space in gigabytes, and the GPU used (or null).
  *
  * @param[in] f            Output stream.
  * @param[in] info         Pointer to SystemInfo structure to print.
@@ -55,8 +55,8 @@ void print_dataset_info(FILE *f, const DatasetInfo *info, const unsigned int ind
  * @brief Print the denoising configuration as formatted JSON.
  *
  * Outputs `"denoise": null` if the stage is disabled, otherwise its
- * parameters, parallelization mode, and the noise standard deviations
- * used (given, or estimated per image).
+ * parameters and the noise standard deviations used (given, or estimated
+ * per image).
  *
  * @param[in] f            Output stream.
  * @param[in] info         Pointer to DenoiseInfo structure to print.

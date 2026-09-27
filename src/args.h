@@ -35,8 +35,8 @@ typedef struct {
 	unsigned int wtrials; /**< Warmup benchmark trials (-w, requires -b) */
 	int progress;         /**< Non-zero to show progress bars (-p) */
 	int denoise;          /**< Non-zero to run NLM denoising (-d) */
-	int mode;             /**< Filter parallelization mode (-m), PAR_* */
-	NlmParams nlm;        /**< NLM parameters (-P, -S, -H, -N, -A) */
+	int gpu;              /**< Non-zero to denoise on the GPU (-g) */
+	NlmParams nlm;        /**< NLM parameters (-P, -S, -H, -N) */
 } Args;
 
 /* ------------------------------------------------------------------------- */
@@ -59,12 +59,11 @@ typedef struct {
  *   -w <wtrials>  Warmup benchmark trials (requires -b)
  *   -p            Show progress bars
  *   -d            Denoise with Non-Local Means
+ *   -g            Denoise on the GPU (CUDA), pipelined with the CPU stages
  *   -P <radius>   NLM patch radius
  *   -S <radius>   NLM search radius
  *   -H <k>        NLM strength, h = k * sigma
  *   -N <sigma>    NLM noise standard deviation (default: estimated per image)
- *   -A <method>   NLM method: integral or direct
- *   -m <mode>     Filter parallelization: auto, image or pixel
  *   -h            Show usage and exit
  *
  * Required argument:

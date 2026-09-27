@@ -24,25 +24,19 @@
  * Borders are handled by mirroring the image. Every output pixel depends
  * only on the input, so the result is identical for any thread count.
  *
- * Two methods are provided, with bit-for-bit identical output:
- *   direct    patches compared pixel by pixel, (2S+1)^2 (2P+1)^2 per pixel
- *   integral  patch sums from integral images of the squared differences,
- *             about (2S+1)^2 per pixel, independent of the patch size
+ * Patch distances are computed with integral images, at a cost of about
+ * (2S+1)^2 per pixel independent of the patch size, and the work of an
+ * image is split into bands of rows that can run on any thread: see
+ * nlm_job_prepare().
  */
 
 #ifndef NLM_H
 #define NLM_H
 
-#include "image.h"
+#include <stdint.h>
 
-/**
- * @enum NLM methods
- * @brief Ways of computing the patch distances (identical results).
- */
-enum {
-	NLM_INTEGRAL = 0, /**< Integral images, cost independent of the patch size */
-	NLM_DIRECT        /**< Patches compared pixel by pixel */
-};
+#include "image.h"
+#include "progress.h"
 
 /* ------------------------------------------------------------------------- */
 /*                              Data Structures                              */
@@ -57,31 +51,151 @@ typedef struct {
 	unsigned int search; /**< Search radius: window is (2r+1) x (2r+1) */
 	double h_factor;     /**< Filtering strength k, with h = k * sigma */
 	double sigma;        /**< Noise standard deviation, < 0: estimate per image */
-	int method;          /**< NLM_INTEGRAL or NLM_DIRECT */
 } NlmParams;
+
+/**
+ * @struct NlmContext
+ * @brief Per-image values shared by all bands (internal).
+ */
+typedef struct {
+	const unsigned char *pad; /**< Mirrored, padded input */
+	size_t pw;                /**< Width of the padded input */
+	long w;                   /**< Image width */
+	long h;                   /**< Image height */
+	int p;                    /**< Patch radius */
+	int s;                    /**< Search radius */
+	double offset;            /**< 2 sigma^2 * patch area */
+	double inv;               /**< 1 / (h^2 * patch area) */
+	int cutoff;               /**< Largest patch sum with a non-negligible weight */
+	const float *wtab;        /**< Weight per patch sum 0..cutoff, 0 at cutoff+1; or NULL */
+} NlmContext;
+
+/**
+ * @struct NlmJob
+ * @brief One image being denoised band by band.
+ *
+ * A job splits the work of an image into bands of rows that can run on any
+ * thread, in any order: nlm_job_prepare(), then nlm_job_run() for every
+ * band, then nlm_job_finish(). Treat as opaque.
+ */
+typedef struct {
+	NlmContext ctx;      /**< Shared per-image values */
+	unsigned char *pad;  /**< Owned padded input */
+	float *tab;          /**< Owned weight table, or NULL */
+	Image out;           /**< Output being filled */
+	long band;           /**< Rows per band */
+	long bands;          /**< Number of bands (0: nothing to run) */
+} NlmJob;
+
+/**
+ * @struct NlmScratch
+ * @brief Per-thread working memory for running bands.
+ */
+typedef struct {
+	unsigned int width;  /**< Largest image width served */
+	long band;           /**< Largest band height served */
+	unsigned int patch;  /**< Patch radius */
+	uint32_t *ii;        /**< Integral image of one band */
+	float *acc;          /**< Weight accumulators of one band */
+	uint32_t *sums;      /**< Patch sums of one row */
+} NlmScratch;
 
 /* ------------------------------------------------------------------------- */
 /*                            Public API Functions                           */
 /* ------------------------------------------------------------------------- */
 
 /**
- * @brief Denoises an image with Non-Local Means.
+ * @brief Allocates scratch buffers for running bands.
  *
- * Allocates @p dst. With @p parallel set, the work of the image is
- * distributed over the OpenMP threads (rows for the direct method, bands
- * for the integral method); otherwise the image is processed by the
- * calling thread alone (used when parallelizing across images).
+ * @param[in] width Largest image width the scratch will serve.
+ * @param[in] band  Largest band height, in rows.
+ * @param[in] patch Patch radius.
  *
- * @param[in]  src       Noisy image.
- * @param[out] dst       Denoised image (allocated, caller frees).
+ * @return Newly allocated scratch, or NULL on allocation failure.
+ */
+NlmScratch* nlm_scratch_new(unsigned int width, long band, unsigned int patch);
+
+/**
+ * @brief Frees scratch buffers. Safe to call with NULL.
+ *
+ * @param[in,out] s Scratch.
+ */
+void nlm_scratch_free(NlmScratch *s);
+
+/**
+ * @brief Prepares an image for denoising, band by band.
+ *
+ * Estimates the noise (unless given), pads the image, builds the weight
+ * table and allocates the output. With @p parallel set, these steps use
+ * the OpenMP threads.
+ *
+ * @param[in]  src       Noisy image (must outlive the job).
  * @param[in]  p         Filter parameters.
- * @param[in]  parallel  Non-zero to parallelize within the image.
+ * @param[in]  band      Rows per band (> 0).
+ * @param[in]  parallel  Non-zero to parallelize the preparation.
+ * @param[out] job       Job to initialize.
  * @param[out] sigma_out Noise standard deviation used (may be NULL).
  *
  * @return IMG_OK, or IMG_ERR_NOMEM / IMG_ERR_SIZE.
  */
-int nlm_denoise(const Image *src, Image *dst, const NlmParams *p, int parallel,
-                double *sigma_out);
+int nlm_job_prepare(const Image *src, const NlmParams *p, long band, int parallel,
+                    NlmJob *job, double *sigma_out);
+
+/**
+ * @brief Number of bands of a prepared job (0 if there is nothing to do).
+ *
+ * @param[in] job Prepared job.
+ *
+ * @return Number of bands.
+ */
+long nlm_job_bands(const NlmJob *job);
+
+/**
+ * @brief Denoises one band of a prepared job.
+ *
+ * Bands of the same job, or of different jobs, may run concurrently on
+ * different threads, each with its own scratch.
+ *
+ * @param[in,out] job     Prepared job.
+ * @param[in]     b       Band index, 0 <= b < nlm_job_bands(job).
+ * @param[in,out] scratch Scratch at least as wide as the image and as tall
+ *                        as the band.
+ */
+void nlm_job_run(NlmJob *job, long b, NlmScratch *scratch);
+
+/**
+ * @brief Completes a job: releases its buffers and hands over the output.
+ *
+ * @param[in,out] job Job whose bands have all run.
+ * @param[out]    dst Denoised image (caller frees).
+ */
+void nlm_job_finish(NlmJob *job, Image *dst);
+
+/**
+ * @brief Releases a job without producing output. Safe on a zeroed job.
+ *
+ * @param[in,out] job Job.
+ */
+void nlm_job_discard(NlmJob *job);
+
+/**
+ * @brief Number of progress units of one image: its search offsets.
+ *
+ * The cost of denoising is proportional to the number of offsets of the
+ * search window, 4 S (S + 1), so progress is counted in those units, split
+ * over the bands of the image.
+ *
+ * @param[in] p Filter parameters.
+ *
+ * @return 4 S (S + 1).
+ */
+size_t nlm_units(const NlmParams *p);
+
+/**
+ * @brief Progress units of band @p b out of @p bands, for an image of
+ *        @p units units: the shares add up to exactly @p units.
+ */
+size_t nlm_band_units(size_t units, long b, long bands);
 
 /**
  * @brief Estimates the noise standard deviation of an image.
@@ -98,23 +212,5 @@ int nlm_denoise(const Image *src, Image *dst, const NlmParams *p, int parallel,
  * @return Estimated noise standard deviation in gray levels.
  */
 double nlm_noise_estimate(const Image *img, int parallel);
-
-/**
- * @brief Returns the name of an NLM method ("direct", "integral").
- *
- * @param[in] method NLM_* value.
- *
- * @return Static name string.
- */
-const char* nlm_method_name(int method);
-
-/**
- * @brief Parses an NLM method name.
- *
- * @param[in] name Method name.
- *
- * @return NLM_* value, or -1 if unknown.
- */
-int nlm_method_from_name(const char *name);
 
 #endif /* NLM_H */

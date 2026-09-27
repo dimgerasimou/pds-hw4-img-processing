@@ -32,6 +32,9 @@
 static void
 draw(const Progress *p, size_t done)
 {
+	if (done > p->total)
+		done = p->total;
+
 	double pct = p->total ? (double)done / (double)p->total : 1.0;
 	double elapsed = omp_get_wtime() - p->start;
 	int filled = (int)(pct * BAR_WIDTH);

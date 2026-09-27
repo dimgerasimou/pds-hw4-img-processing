@@ -11,8 +11,8 @@ Assignment #4 of the **Parallel and Distributed Systems** coursework: [parallel-
 **Canny edge detection** on multicore CPUs (**OpenMP**) and **single NVIDIA GPUs** (**CUDA**), with a strong
 emphasis on comparing parallelization strategies and reproducible benchmarking.
 
-> **Status:** the I/O pipeline, benchmarking, and NLM denoising with OpenMP are implemented.
-> Canny edge detection and the CUDA backend are in progress.
+> **Status:** the I/O pipeline, benchmarking, and NLM denoising on the CPU (OpenMP) and the GPU (CUDA)
+> are implemented. Canny edge detection is in progress.
 
 ## Overview
 
@@ -39,20 +39,22 @@ impractical.
 - Thread-safe **progress bars** for every stage
 - Automated benchmarking with **JSON output**: system information, dataset information, and per-stage
   wall time, throughput and per-image statistics
-- **Non-Local Means denoising** with OpenMP, parallelized either across images or within each image
-- Planned:
-  - **NLM denoising** — CUDA
-  - **Canny edge detection** — sequential, OpenMP and CUDA
+- **Non-Local Means denoising** with integral images, parallelized over bands of all images of a batch
+- **GPU denoising** (CUDA), pipelined with the CPU stages, bit-for-bit identical to the CPU
+- Planned: **Canny edge detection** — sequential, OpenMP and CUDA
 
 ## Build
 
 ### Requirements
 - C compiler with OpenMP support (`gcc` or `clang`)
 - `make`
+- Optional: CUDA Toolkit and an NVIDIA GPU, for `-g`
 
 ### Compile
 ```bash
-make
+make                 # CUDA is used when nvcc is found
+make CUDA=0          # CPU-only build
+make GPU_ARCH=86     # CUDA architecture (default: detected with nvidia-smi, else 75)
 ```
 
 Produces:
@@ -60,7 +62,8 @@ Produces:
 bin/imgfilter
 ```
 
-Run `make help` for all targets and overrides.
+Without a CUDA toolkit the program builds CPU-only and `-g` reports that CUDA is unavailable. Run
+`make help` for all targets and overrides.
 
 ## Usage
 
@@ -79,6 +82,7 @@ Run `make help` for all targets and overrides.
 | `-w <n>`      | Warmup benchmark trials (default: 0, requires `-b`)     |
 | `-p`          | Show progress bars (on stderr)                          |
 | `-d`          | Denoise with Non-Local Means (see below)                |
+| `-g`          | Denoise on the GPU (CUDA), pipelined with the CPU stages |
 | `-h`          | Show help                                               |
 
 Input and output follow the conventions of `cp`:
@@ -136,68 +140,120 @@ out(p)  = Σ w(p,q)·I(q) / Σ w(p,q)
 Two noisy copies of the same patch differ by 2σ² on average, which is subtracted so that identical
 structure gets full weight. The pixel itself is weighted like its most similar neighbor.
 
-| Option      | Parameter                          | Default                  | Effect |
-| ----------- | ---------------------------------- | ------------------------ | ------ |
-| `-P <r>`    | patch radius, patches (2r+1)²      | 2 (5×5)                  | larger: more robust similarity under strong noise, less fine detail |
-| `-S <r>`    | search radius, window (2r+1)²      | 10 (21×21)               | larger: more candidates, stronger denoising |
-| `-H <k>`    | strength, h = k·σ                  | 0.4                      | larger: smoother; smaller: more noise kept |
-| `-N <σ>`    | noise standard deviation           | estimated per image      | scale of h and of the 2σ² offset |
-| `-A <name>` | method: `integral` or `direct`     | `integral`               | performance only; the output is identical |
-| `-m <mode>` | parallelization (see below)        | `auto`                   | performance only; the output is identical |
+| Option   | Parameter                          | Default                  | Effect |
+| -------- | ---------------------------------- | ------------------------ | ------ |
+| `-P <r>` | patch radius, patches (2r+1)²      | 2 (5×5)                  | larger: more robust similarity under strong noise, less fine detail |
+| `-S <r>` | search radius, window (2r+1)²      | 10 (21×21)               | larger: more candidates, stronger denoising; cost ∝ (2r+1)² |
+| `-H <k>` | strength, h = k·σ                  | 0.4                      | larger: smoother; smaller: more noise kept |
+| `-N <σ>` | noise standard deviation           | estimated per image      | scale of h and of the 2σ² offset |
 
 The defaults are the paper's recommendation for moderate noise. When `-N` is not given, σ is estimated
 for every image with Immerkær's method (*Fast Noise Variance Estimation*, 1996), using integer sums so the
 estimate does not depend on the thread count. The estimate reads low on images with large saturated
 areas (e.g. pure black backgrounds), where clipping has removed part of the noise; use `-N` there.
 
-**Methods** (`-A`). Both produce bit-for-bit identical output:
+### Algorithm
 
-- `direct` compares every pair of patches pixel by pixel: (2S+1)²·(2P+1)² operations per pixel
-  (11,025 with the defaults). A comparison stops as soon as its partial sum shows the weight will be
-  negligible, which skips most of the work on images with little noise.
-- `integral` (default) exchanges the loops: for every offset of the search window, the squared
-  differences between the image and its shifted copy are accumulated into an integral image
-  (summed-area table), from which any patch sum is read with 4 lookups. The cost is about (2S+1)² per
-  pixel, independent of the patch size (Darbon et al., ISBI 2008). The image is processed in bands of
-  about 32 rows so that each band's integral image and accumulators stay in the L2 cache; 32-bit
+Comparing every pair of patches directly costs (2S+1)²·(2P+1)² operations per pixel, 11,025 with the
+defaults. Instead, for every offset of the search window, the squared differences between the image and
+its shifted copy are accumulated into an integral image (summed-area table), from which any patch sum is
+read with 4 lookups (Darbon et al., ISBI 2008). The cost becomes about (2S+1)² per pixel, independent of
+the patch size. On top of that:
+
+- **Weight table.** A weight depends only on the integer patch sum, so the weights of all possible sums
+  are computed once per image; the table holds exactly the values `expf()` would return.
+- **Offset blocking.** Offsets are processed in groups of 4: their integral images are built in one
+  interleaved pass whose independent running sums the processor overlaps, and every pixel's accumulators
+  are loaded and stored once per group instead of once per offset, with the additions in the same order.
+- **Chunked rejection.** The patch sums of a row are computed in a branch-free, vectorizable loop, and
+  chunks of 16 pixels in which every candidate is rejected (most of them on clean images) are skipped.
+- **Mirrored padding.** The image is padded once so the inner loops need no bounds checks, and 32-bit
   integral values are allowed to wrap, since patch sums are exact modulo 2³².
 
-In both, a weight depends only on the integer patch sum, so the weights of all possible sums are
-computed once per image into a table instead of calling `expf()` for every candidate; the table holds
-exactly the values `expf()` would return.
+Single-thread times on a 512×512 crop of a chest X-ray, defaults (P=2, S=10):
 
-Single-thread times, 512×512 crop of a chest X-ray, defaults (P=2, S=10):
+| Input                  | direct comparison | this implementation |
+| ---------------------- | ----------------: | ------------------: |
+| clean X-ray (σ ≈ 0.8)  | 2.10 s            | 0.15 s              |
+| noise σ = 10 added     | 3.32 s            | 0.36 s              |
+| noise σ = 40 added     | 3.47 s            | 0.34 s              |
 
-| Input                  | direct (original) | direct | integral |
-| ---------------------- | ----------------: | -----: | -------: |
-| clean X-ray (σ ≈ 0.8)  | 2.10 s            | 0.98 s | 0.17 s   |
-| noise σ = 10 added     | 3.32 s            | 2.08 s | 0.34 s   |
-| noise σ = 40 added     | 3.47 s            | 2.31 s | 0.42 s   |
+During development the output was verified against a direct implementation and a double-precision
+reference: it is identical to the direct method bit for bit, and to the reference except at rounding
+ties (a result within float precision of x.5, one gray level), which only occur with degenerate settings
+such as 1×1 patches.
 
-The integral method is 5–12× faster than the optimized direct method and 10–19× faster than the
-original. On clean images, rejected candidates are skipped with a well-predicted branch; a branch-free
-loop would be faster on very noisy images but slower on clean ones.
+Measured and rejected: compiling for the host CPU (`-march=native`) does not help, since the hot loops are
+limited by the integral-image recurrence and by data-dependent branches, not by vector width; ignoring
+weights below 10⁻³ as OpenCV does is 18–24% *slower* on noisy images, because rejecting about half the
+candidates makes the branch unpredictable, and it changes the output; a branch-free accumulation loop is
+faster on very noisy images but slower on clean ones. Candidate preselection and blockwise NLM (Coupé et
+al., 2008) reduce the number of weight computations, which here are not the dominant cost. Symmetric
+weights would save up to ~1.5× at the price of exact reproducibility.
 
-**Parallelization** (`-m`):
+### Parallelization
 
-| Mode    | Work distribution                                                         |
-| ------- | ------------------------------------------------------------------------- |
-| `image` | threads take whole images of the batch; each image is filtered serially  |
-| `pixel` | images are filtered one at a time; the threads split each image's rows   |
-| `auto`  | `image` when the batch holds at least one image per thread, else `pixel` |
+The work of every image is split into bands of rows. For each batch:
 
-`pixel` is the only mode that speeds up a single image (rows for `direct`, bands for `integral`);
-`image` avoids synchronization inside the filter but depends on having enough images, of similar size,
-per batch. The output is identical for
-every mode and thread count; `-t 1` is the serial baseline.
+1. every image is prepared (noise estimate, padding, weight table): one image per thread when the batch
+   has at least one image per thread, otherwise one image at a time with all threads;
+2. the bands of *all* images of the batch form one pool that the threads draw from dynamically, bands of
+   the widest images first, so the last bands to finish are the cheapest;
+3. the outputs are collected.
+
+A large image is thus spread over all threads, and the idle time at the end of a batch is at most about
+one band. Band height is about four bands per thread over the batch, 16–32 rows (every band recomputes
+2P extra rows of integral image, so bands should not be too small); with fewer images than threads,
+each image gets a multiple of the thread count of bands, so a single image divides evenly.
+
+The output is identical for any thread count; `-t 1` is the serial baseline.
 
 ```bash
 # denoise a directory
 ./bin/imgfilter -d -o clean/ noisy/
 
-# stronger smoothing, known noise level, one image on all threads
-./bin/imgfilter -d -H 0.6 -N 20 -m pixel -o clean.pgm noisy.png
+# stronger smoothing with a known noise level
+./bin/imgfilter -d -H 0.6 -N 20 -o clean.pgm noisy.png
 ```
+
+## GPU Denoising
+
+`-g` runs the denoising on the GPU. The CPU still prepares every image (noise estimate, mirrored padding,
+weight table) and the GPU computes the denoised pixels.
+
+**Kernel.** One thread per output pixel, in blocks of 32×16. A block loads its tile of the padded image,
+plus a border of P+S pixels, into shared memory once, then loops over all offsets of the search window:
+for each offset it computes the squared differences between the tile and its shifted copy in shared
+memory, sums them over the patch width, and every thread sums its column over the patch height. That is
+the pixel's exact integer patch sum. Weights come from the table built by the CPU, and every thread keeps
+its accumulators in registers for the whole loop, so they cost no memory traffic. (The integral-image
+method used on the CPU relies on sequential prefix sums and on streaming the image once per offset,
+which suits a GPU poorly; per-block shared-memory sums are the standard GPU formulation.)
+
+**Exactness.** The GPU computes the same integer patch sums, uses the same weights, adds the offsets in
+the same order, and is compiled without fused multiply-add (`-fmad=false`, and no fast math), so its
+output is **bit-for-bit identical** to the CPU's. To verify on a machine with a GPU:
+
+```bash
+./bin/imgfilter -d    -o cpu/ data/
+./bin/imgfilter -d -g -o gpu/ data/
+diff -r cpu/ gpu/ && echo identical
+```
+
+An image whose parameters need a larger weight table than the limit (very strong noise with very large
+patches) is denoised on the CPU instead, with the same result.
+
+**Pipeline.** With the GPU, three batches are in flight: while the GPU denoises batch *k*, the CPU reads,
+decodes and prepares batch *k+1* and encodes and writes batch *k−1*. Two OpenMP sections run side by
+side: the GPU one is a single thread that sleeps while waiting for the GPU (blocking synchronization), the
+CPU one uses all threads in its own nested parallel regions. Memory is therefore about three batches.
+
+On the CPU alone such a pipeline gains nothing: every stage already keeps all cores busy (measured: 0.3%
+idle time over a full run). With the GPU, the CPU would otherwise sit idle during denoising, so the
+pipeline hides nearly all of the I/O and codec work behind it.
+
+With the pipeline, stage wall times overlap, so they add up to more than `pipeline_time`; per-image
+denoise time is the CPU preparation plus the GPU run.
 
 ## Batch Processing
 
@@ -227,7 +283,11 @@ per batch, where threads wait for the slowest image; with `B` much larger than t
 is negligible.
 
 With `-p`, a progress bar shows each run of the pipeline (and, when benchmarking, each warmup and
-timed trial).
+timed trial). Progress is weighted by cost: every I/O and codec stage counts one unit per image, and
+denoising counts one unit per search offset (440 with the defaults), shared out over each batch in
+proportion to the images' pixel counts and advanced band by band. The bar therefore moves at a
+roughly constant rate even though denoising takes over 90% of the time; it cannot be exact, since
+the cost of a band also depends on its content (flat noisy regions keep more candidates than edges).
 
 ## Image Formats
 
@@ -254,17 +314,21 @@ supported, so no dynamic range is lost) or PNG first.
 
 With `-b`, the pipeline runs `-w` warmup trials (not recorded), then `-n` timed trials, and a JSON
 document is written containing:
-- `sys_info` — CPU model, logical cores, RAM and swap
+- `sys_info` — CPU model, logical cores, RAM and swap, and the GPU used (name, compute capability,
+  multiprocessors, memory, driver and runtime versions) or `null`
 - `benchmark_info` — timestamp, threads, trials, warmup trials, batch size and number of batches
 - `dataset_info` — input/output paths, output format, number of images per input format, total pixels,
   range of dimensions
-- `denoise` — `null`, or the NLM parameters, parallelization mode, and the noise levels σ used
+- `denoise` — `null`, or the device (`cpu` or `cuda`), the NLM parameters and the noise levels σ used
   (mean / min / max over the images)
 - `results` — for each stage: images processed and failed, data volume, throughput, and two timing
   summaries (mean / median / standard deviation / min / max / total): `wall_time`, the stage's elapsed
   time over the trials, and `per_image`, the individual image times over all trials; `null` for stages
   that did not run
 - `pipeline_time` — elapsed time of the whole pipeline over the trials
+- `gpu_time` — with `-g`: the GPU's own time (CUDA events) for uploading the images and weight tables,
+  running the kernel, and downloading the results, totals per trial with statistics over trials;
+  `null` otherwise
 - `memory` — peak resident memory, and major/minor page faults during the timed trials
 
 | Stage    | Work                       | Data volume (`data_mib`) |
@@ -301,11 +365,14 @@ tools/bench.sh -t "1 2 4 8 16" -B "16 64 256 1024" -f pgm data/xrays
 # cold cache: page cache dropped (sudo) before every run
 tools/bench.sh -c cold -n 3 -t "8 16" data/xrays
 
-# denoising: both parallelization modes over thread counts, with filter parameters
-tools/bench.sh -d -m "image pixel" -t "1 2 4 8 16" -x "-P 2 -S 7" data/xrays_subset
+# denoising over thread counts, with filter parameters
+tools/bench.sh -d -t "1 2 4 8 16" -n 3 -x "-S 7" data/xrays_subset
 
-# denoising: both methods on one image, speedup over one thread
-tools/bench.sh -d -a "direct integral" -m pixel -t "1 2 4 8 16" image.jpeg
+# one image, speedup over one thread
+tools/bench.sh -d -t "1 2 4 8 16" -n 3 image.jpeg
+
+# GPU
+tools/bench.sh -d -x "-g" -t 16 -n 3 data/xrays_subset
 ```
 
 When thread count 1 is part of a sweep, the summary shows each run's speedup over the 1-thread run of
@@ -325,6 +392,9 @@ src/
 ├── io.[ch]         Input/output resolution and parallel loading/saving
 ├── image.[ch]      Image container and codecs
 ├── nlm.[ch]        Non-Local Means denoising and noise estimation
+├── gpu.h           GPU backend interface
+├── gpu.cu          CUDA kernel and wrappers (the only CUDA file)
+├── gpu_none.c      GPU backend for builds without CUDA
 ├── progress.[ch]   Thread-safe progress bar
 ├── benchmark.[ch]  Timing, statistics and system information
 ├── json.[ch]       JSON output
@@ -334,7 +404,7 @@ src/
     ├── stb_image.h
     └── stb_image_write.h
 tools/
-└── bench.sh        Benchmark sweeps over threads, batch sizes and modes
+└── bench.sh        Benchmark sweeps over threads and batch sizes
 ```
 
 ## Third-Party Code

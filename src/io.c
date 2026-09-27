@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "error.h"
+#include "gpu.h"
 #include "io.h"
 #include "nlm.h"
 #include "progress.h"
@@ -35,10 +36,27 @@ static const char *stage_names[STAGE_COUNT] = {
 	"read", "decode", "denoise", "encode", "write"
 };
 
-/* Parallelization mode names, indexed by PAR_* */
-static const char *mode_names[PAR_COUNT] = {
-	"auto", "image", "pixel"
-};
+/*
+ * Band height for the denoise stage. With at least one image per thread,
+ * about BAND_PER_THREAD bands per thread over the batch, within
+ * [BAND_MIN_ROWS, BAND_MAX_ROWS]: smaller bands balance the load better,
+ * but every band recomputes 2 * patch radius extra rows of integral image,
+ * so they should not get too small. With fewer images than threads, every
+ * image gets a multiple of the thread count of bands of at most
+ * BAND_MAX_ROWS rows, so that each image divides evenly over the threads.
+ */
+#define BAND_PER_THREAD 4
+#define BAND_MIN_ROWS   16
+#define BAND_MAX_ROWS   32
+
+/**
+ * @struct BandOrder
+ * @brief Image index with its sort key, for ordering the denoise work.
+ */
+typedef struct {
+	size_t k;           /**< Index within the batch */
+	unsigned int width; /**< Image width: bands of wider images cost more */
+} BandOrder;
 
 /**
  * @struct OutName
@@ -537,30 +555,6 @@ do_decode(ImageItem *it)
 }
 
 /**
- * @brief Denoise stage for one image: img -> img (replaced).
- *
- * @param[in,out] it       Image.
- * @param[in]     cfg      Denoising configuration.
- * @param[in]     parallel Non-zero to parallelize within the image.
- */
-static int
-do_denoise(ImageItem *it, const DenoiseConfig *cfg, int parallel)
-{
-	Image out;
-	int r;
-
-	it->bytes[STAGE_DENOISE] = image_bytes(&it->img);
-
-	r = nlm_denoise(&it->img, &out, &cfg->params, parallel, &it->sigma);
-	if (r != IMG_OK)
-		return r;
-
-	image_free(&it->img);
-	it->img = out;
-	return IMG_OK;
-}
-
-/**
  * @brief Encode stage for one image: img -> buf. Releases img.
  *
  * Encoding is the last use of the pixels, so they are freed right away.
@@ -593,6 +587,54 @@ do_write(ImageItem *it)
 }
 
 /**
+ * @brief Progress units of one image in a stage.
+ *
+ * Denoising costs about as many units as its search window has offsets;
+ * every other stage counts 1. See io_progress_units().
+ */
+static size_t
+io_stage_units(const ImageSet *set, int stage)
+{
+	return (stage == STAGE_DENOISE) ? nlm_units(&set->denoise.params) : 1;
+}
+
+/**
+ * @brief Adds @p wall seconds to a stage's total and marks it performed.
+ *
+ * Atomic: with the GPU pipeline, the CPU and GPU threads can finish parts
+ * of the same stage (preparation and GPU run of denoising) concurrently.
+ */
+static void
+stage_done(ImageSet *set, int stage, double wall)
+{
+	#pragma omp atomic
+	set->wall_time_s[stage] += wall;
+
+	#pragma omp atomic write
+	set->performed[stage] = 1;
+}
+
+/**
+ * @brief Marks a stage as not attempted for an image.
+ *
+ * @param[in,out] it    Image.
+ * @param[in]     stage STAGE_* value.
+ * @param[in]     units Progress units of the stage for other stages.
+ *
+ * @return Progress units the skipped image still accounts for.
+ */
+static size_t
+skip(ImageItem *it, int stage, size_t units)
+{
+	/* also tells the compiler the range, which the OpenMP-outlined caller loses */
+	if (stage < 0 || stage >= STAGE_COUNT)
+		return units;
+
+	it->err[stage] = IO_NOT_DONE;
+	return (stage == STAGE_DENOISE) ? it->units : units;
+}
+
+/**
  * @brief Checks whether an image holds valid pixels after the pixel stages.
  *
  * Denoising is optional: when it did not run, the decoded pixels are used.
@@ -622,24 +664,281 @@ eligible(const ImageSet *set, const ImageItem *it, int stage)
 }
 
 /**
- * @brief Decides whether a stage parallelizes across the images of a range.
+ * @brief Distributes the denoise progress units of a batch over its images.
  *
- * I/O and codec stages always do. Filter stages follow their configured
- * mode; in auto mode they do when there is at least one image per thread.
+ * The batch owns (images x nlm_units()) units, a constant, so the bar's
+ * total never changes. Within the batch they are shared in proportion to
+ * the images' pixel counts, since denoising time is proportional to them:
+ * without this, bands of a large image would advance the bar as much as
+ * those of a small one. Images that will not be denoised keep one image's
+ * worth, which they add at once. Shares are rounded cumulatively so that
+ * they add up exactly.
+ */
+static void
+assign_units(ImageSet *set, size_t first, size_t last)
+{
+	const size_t per = nlm_units(&set->denoise.params);
+	size_t pool = 0, done = 0;
+	unsigned long long px = 0, acc = 0;
+
+	for (size_t i = first; i < last; i++) {
+		ImageItem *it = &set->items[i];
+
+		if (eligible(set, it, STAGE_DENOISE)) {
+			px += image_bytes(&it->img);
+			pool += per;
+		} else {
+			it->units = per;
+		}
+	}
+
+	for (size_t i = first; i < last; i++) {
+		ImageItem *it = &set->items[i];
+		size_t upto;
+
+		if (!eligible(set, it, STAGE_DENOISE))
+			continue;
+
+		acc += image_bytes(&it->img);
+		upto = px ? (size_t)((unsigned long long)pool * acc / px) : pool;
+		it->units = upto - done;
+		done = upto;
+	}
+}
+
+/**
+ * @brief Comparison function: wider images first.
  */
 static int
-across_images(const ImageSet *set, int stage, size_t n)
+cmp_band_order(const void *a, const void *b)
 {
-	int mode;
+	const BandOrder *x = a, *y = b;
 
-	if (stage != STAGE_DENOISE)
-		return 1;
+	if (x->width != y->width)
+		return (x->width < y->width) ? 1 : -1;
+	return (x->k > y->k) - (x->k < y->k);
+}
 
-	mode = set->denoise.mode;
-	if (mode == PAR_AUTO)
-		return n >= (size_t)omp_get_max_threads();
+/**
+ * @brief Finds the job owning global band @p g: start[k] <= g < start[k+1].
+ */
+static size_t
+find_job(const long *start, size_t n, long g)
+{
+	size_t lo = 0, hi = n;
 
-	return mode == PAR_IMAGE;
+	/* last k with start[k] <= g */
+	while (hi - lo > 1) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (start[mid] <= g)
+			lo = mid;
+		else
+			hi = mid;
+	}
+
+	return lo;
+}
+
+/**
+ * @brief Band height for an image of @p h rows (see BAND_* above).
+ *
+ * @param[in] h       Image height.
+ * @param[in] band    Band height used with at least one image per thread.
+ * @param[in] few     Non-zero when the batch has fewer images than threads.
+ * @param[in] threads Number of threads.
+ */
+static long
+band_rows(long h, long band, int few, long threads)
+{
+	long nb;
+
+	if (!few)
+		return band;
+
+	nb = (h + BAND_MAX_ROWS - 1) / BAND_MAX_ROWS;
+	nb = ((nb + threads - 1) / threads) * threads;
+	band = (h + nb - 1) / nb;
+	return band > 0 ? band : 1;
+}
+
+/**
+ * @brief Denoise stage over the images [first, last).
+ *
+ * 1. Prepare every image (noise estimate, padding, weight table): with at
+ *    least one image per thread, one image per thread; otherwise one image
+ *    at a time, each using all threads.
+ * 2. Run every band of every image as one pool of work, handed out to the
+ *    threads dynamically: a large image is spread over all threads and the
+ *    idle time at the end is at most about one band. Bands of wider (more
+ *    expensive) images are handed out first, so the last ones are cheap.
+ * 3. Collect the outputs.
+ *
+ * An image's recorded time is the thread time spent on it (preparation plus
+ * its bands).
+ *
+ * @return Number of images that failed.
+ */
+static size_t
+denoise_bands(ImageSet *set, size_t first, size_t last, Progress *progress)
+{
+	const NlmParams *p = &set->denoise.params;
+	const size_t n = last - first;
+	const long threads = omp_get_max_threads();
+	NlmJob *jobs = calloc(n ? n : 1, sizeof(NlmJob));
+	BandOrder *order = malloc((n ? n : 1) * sizeof(BandOrder));
+	long *start = malloc((n + 1) * sizeof(long));
+	long *left = calloc(n ? n : 1, sizeof(long));
+	unsigned int maxw = 0;
+	long rows = 0, band, maxband = 0, total;
+	size_t failed = 0, m = 0, count = 0;
+	int nomem = 0, few;
+
+	if (!jobs || !order || !start || !left) {
+		DERRNOF("allocation failed");
+		free(jobs); free(order); free(start); free(left);
+		for (size_t i = first; i < last; i++) {
+			ImageItem *it = &set->items[i];
+			it->err[STAGE_DENOISE] = eligible(set, it, STAGE_DENOISE) ? IMG_ERR_NOMEM : IO_NOT_DONE;
+			failed += (it->err[STAGE_DENOISE] == IMG_ERR_NOMEM);
+			progress_add(progress, it->units);
+		}
+		return failed;
+	}
+
+	for (size_t k = 0; k < n; k++) {
+		const ImageItem *it = &set->items[first + k];
+		if (eligible(set, it, STAGE_DENOISE)) {
+			rows += (long)it->img.height;
+			if (it->img.width > maxw)
+				maxw = it->img.width;
+			count++;
+		}
+	}
+
+	few = (count < (size_t)threads);
+	band = rows / (BAND_PER_THREAD * threads);
+	band = band < BAND_MIN_ROWS ? BAND_MIN_ROWS : band > BAND_MAX_ROWS ? BAND_MAX_ROWS : band;
+
+	/*
+	 * 1. prepare: with few images, each one with all threads (noise estimate,
+	 *    padding and table are parallel inside); otherwise one per thread
+	 */
+	#pragma omp parallel for schedule(dynamic) reduction(+:failed) if(!few)
+	for (size_t k = 0; k < n; k++) {
+		ImageItem *it = &set->items[first + k];
+		double ts;
+
+		if (!eligible(set, it, STAGE_DENOISE)) {
+			it->err[STAGE_DENOISE] = IO_NOT_DONE;
+			progress_add(progress, it->units);
+			continue;
+		}
+
+		it->bytes[STAGE_DENOISE] = image_bytes(&it->img);
+		ts = omp_get_wtime();
+		it->err[STAGE_DENOISE] = nlm_job_prepare(&it->img, p,
+		                                         band_rows((long)it->img.height, band, few, threads),
+		                                         few, &jobs[k], &it->sigma);
+		it->time_s[STAGE_DENOISE] = omp_get_wtime() - ts;
+
+		if (it->err[STAGE_DENOISE] != IMG_OK) {
+			failed++;
+			progress_add(progress, it->units);
+		}
+	}
+
+	for (size_t k = 0; k < n; k++)
+		if (set->items[first + k].err[STAGE_DENOISE] == IMG_OK && jobs[k].band > maxband)
+			maxband = jobs[k].band;
+
+	/* global band numbering, wider images first */
+	for (size_t k = 0; k < n; k++)
+		if (set->items[first + k].err[STAGE_DENOISE] == IMG_OK) {
+			order[m].k = k;
+			order[m].width = set->items[first + k].img.width;
+			m++;
+		}
+
+	qsort(order, m, sizeof(BandOrder), cmp_band_order);
+
+	start[0] = 0;
+	for (size_t j = 0; j < m; j++) {
+		left[j] = nlm_job_bands(&jobs[order[j].k]);
+		start[j + 1] = start[j] + left[j];
+	}
+	total = start[m];
+
+	/* 2. all bands of all images */
+	#pragma omp parallel
+	{
+		NlmScratch *s = NULL;
+
+		if (total > 0) {
+			s = nlm_scratch_new(maxw, maxband, p->patch);
+			if (!s) {
+				#pragma omp atomic write
+				nomem = 1;
+			}
+		}
+
+		#pragma omp for schedule(dynamic)
+		for (long g = 0; g < total; g++) {
+			size_t j = find_job(start, m, g);
+			size_t k = order[j].k;
+			double ts, dt;
+
+			if (!s)
+				continue;
+
+			ts = omp_get_wtime();
+			nlm_job_run(&jobs[k], g - start[j], s);
+			dt = omp_get_wtime() - ts;
+
+			#pragma omp atomic
+			set->items[first + k].time_s[STAGE_DENOISE] += dt;
+
+			#pragma omp atomic update
+			left[j]--;
+
+			progress_add(progress, nlm_band_units(set->items[first + k].units,
+			                                      g - start[j], nlm_job_bands(&jobs[k])));
+		}
+
+		nlm_scratch_free(s);
+	}
+
+	/* 3. collect */
+	for (size_t j = 0; j < m; j++) {
+		size_t k = order[j].k;
+		ImageItem *it = &set->items[first + k];
+		Image out;
+
+		/* done at preparation (nothing to run) */
+		if (nlm_job_bands(&jobs[k]) == 0)
+			progress_add(progress, it->units);
+
+		/* bands never run (no memory): account for them so the bar completes */
+		if (nomem && left[j] > 0)
+			for (long b = nlm_job_bands(&jobs[k]) - left[j]; b < nlm_job_bands(&jobs[k]); b++)
+				progress_add(progress, nlm_band_units(it->units, b, nlm_job_bands(&jobs[k])));
+
+		if (nomem) {
+			nlm_job_discard(&jobs[k]);
+			it->err[STAGE_DENOISE] = IMG_ERR_NOMEM;
+			failed++;
+			continue;
+		}
+
+		nlm_job_finish(&jobs[k], &out);
+		image_free(&it->img);
+		it->img = out;
+	}
+
+	free(jobs);
+	free(order);
+	free(start);
+	free(left);
+	return failed;
 }
 
 /**
@@ -825,8 +1124,9 @@ fail_quiet:
  * region, in input order, unless set->quiet is set. The wall time of the
  * call is added to the stage's total in the set.
  *
- * Every image of the range advances @p progress by one step, eligible or
- * not, so a bar sized as (images x stages run) always reaches 100%.
+ * Every image of the range advances @p progress by its units for the
+ * stage, eligible or not, so a bar sized with io_progress_units() always
+ * reaches 100%. The denoise stage advances it band by band.
  *
  * Data volume recorded per image: bytes read (read), pixel bytes produced
  * (decode), pixel bytes consumed (encode), bytes written (write).
@@ -845,9 +1145,8 @@ fail_quiet:
 size_t
 io_run(ImageSet *set, int stage, size_t first, size_t last, Progress *progress)
 {
-	size_t failed = 0;
+	size_t failed = 0, skip_units;
 	double t0;
-	int outer;
 
 	if (stage < 0 || stage >= STAGE_COUNT) {
 		DERRF("invalid stage: %d", stage);
@@ -857,20 +1156,24 @@ io_run(ImageSet *set, int stage, size_t first, size_t last, Progress *progress)
 	if (last > set->count)
 		last = set->count;
 
-	/* outer: threads over images; otherwise images in turn, threads inside */
-	outer = across_images(set, stage, last - first);
-
 	t0 = omp_get_wtime();
 
-	#pragma omp parallel for schedule(dynamic) reduction(+:failed) if(outer)
+	if (stage == STAGE_DENOISE) {
+		assign_units(set, first, last);
+		failed = denoise_bands(set, first, last, progress);
+		goto done;
+	}
+
+	skip_units = io_stage_units(set, stage);
+
+	#pragma omp parallel for schedule(dynamic) reduction(+:failed)
 	for (size_t i = first; i < last; i++) {
 		ImageItem *it = &set->items[i];
 		double ts;
 		int r;
 
 		if (!eligible(set, it, stage)) {
-			it->err[stage] = IO_NOT_DONE;
-			progress_tick(progress);
+			progress_add(progress, skip(it, stage, skip_units));
 			continue;
 		}
 
@@ -878,7 +1181,6 @@ io_run(ImageSet *set, int stage, size_t first, size_t last, Progress *progress)
 		switch (stage) {
 		case STAGE_READ:   r = do_read(it);                     break;
 		case STAGE_DECODE:  r = do_decode(it);                           break;
-		case STAGE_DENOISE: r = do_denoise(it, &set->denoise, !outer);   break;
 		case STAGE_ENCODE:  r = do_encode(it, set->out_format);          break;
 		default:            r = do_write(it);                            break;
 		}
@@ -891,13 +1193,156 @@ io_run(ImageSet *set, int stage, size_t first, size_t last, Progress *progress)
 		progress_tick(progress);
 	}
 
-	set->wall_time_s[stage] += omp_get_wtime() - t0;
-	set->performed[stage] = 1;
+done:
+	stage_done(set, stage, omp_get_wtime() - t0);
 
 	/* move the bar out of the way so the messages get their own lines */
 	if (failed && !set->quiet) {
 		progress_clear(progress);
 		report_failures(set, stage, first, last);
+	}
+
+	return failed;
+}
+
+/**
+ * @brief GPU denoising, CPU part: prepares the images of a range.
+ *
+ * Computes, for every image, the noise estimate, the mirrored padding and
+ * the weight table (nlm_job_prepare()), in parallel over the images (or,
+ * with fewer images than threads, one image at a time with all threads).
+ * The prepared jobs are kept in the items for io_gpu_denoise().
+ *
+ * @param[in,out] set      Image set (denoising must be enabled).
+ * @param[in]     first    First image of the range.
+ * @param[in]     last     One past the last image of the range.
+ * @param[in,out] progress Progress bar (advanced for images that are skipped).
+ *
+ * @return Number of images that failed.
+ */
+size_t
+io_prepare(ImageSet *set, size_t first, size_t last, Progress *progress)
+{
+	const NlmParams *p = &set->denoise.params;
+	size_t failed = 0, count = 0;
+	double t0 = omp_get_wtime();
+	int few;
+
+	if (last > set->count)
+		last = set->count;
+
+	assign_units(set, first, last);
+
+	for (size_t i = first; i < last; i++)
+		count += eligible(set, &set->items[i], STAGE_DENOISE);
+	few = (count < (size_t)omp_get_max_threads());
+
+	#pragma omp parallel for schedule(dynamic) reduction(+:failed) if(!few)
+	for (size_t i = first; i < last; i++) {
+		ImageItem *it = &set->items[i];
+		double ts;
+
+		if (!eligible(set, it, STAGE_DENOISE)) {
+			it->err[STAGE_DENOISE] = IO_NOT_DONE;
+			progress_add(progress, it->units);
+			continue;
+		}
+
+		/* the GPU processes the whole image at once: one band */
+		it->bytes[STAGE_DENOISE] = image_bytes(&it->img);
+		ts = omp_get_wtime();
+		it->err[STAGE_DENOISE] = nlm_job_prepare(&it->img, p, (long)it->img.height, few,
+		                                         &it->job, &it->sigma);
+		it->time_s[STAGE_DENOISE] = omp_get_wtime() - ts;
+
+		if (it->err[STAGE_DENOISE] != IMG_OK) {
+			failed++;
+			progress_add(progress, it->units);
+		}
+	}
+
+	stage_done(set, STAGE_DENOISE, omp_get_wtime() - t0);
+	return failed;
+}
+
+/**
+ * @brief Denoises a prepared job on the CPU, one band after the other.
+ *
+ * Fallback for jobs the GPU does not support.
+ */
+static int
+cpu_fallback(NlmJob *job, unsigned int width, unsigned int patch)
+{
+	NlmScratch *s = nlm_scratch_new(width, job->band, patch);
+
+	if (!s)
+		return IMG_ERR_NOMEM;
+
+	for (long b = 0; b < nlm_job_bands(job); b++)
+		nlm_job_run(job, b, s);
+
+	nlm_scratch_free(s);
+	return IMG_OK;
+}
+
+/**
+ * @brief GPU denoising, GPU part: denoises the prepared images of a range.
+ *
+ * Runs every image prepared by io_prepare() through the GPU, one after the
+ * other, and replaces its pixels with the result. An image whose parameters
+ * exceed the GPU's weight table limit is denoised on the CPU instead. Meant
+ * to run on its own thread while the CPU stages work on other batches.
+ *
+ * @param[in,out] set      Image set.
+ * @param[in]     first    First image of the range.
+ * @param[in]     last     One past the last image of the range.
+ * @param[in,out] progress Progress bar (advanced per image).
+ *
+ * @return Number of images that failed.
+ */
+size_t
+io_gpu_denoise(ImageSet *set, size_t first, size_t last, Progress *progress)
+{
+	size_t failed = 0;
+	double t0 = omp_get_wtime();
+
+	if (last > set->count)
+		last = set->count;
+
+	for (size_t i = first; i < last; i++) {
+		ImageItem *it = &set->items[i];
+		double ts;
+		Image out;
+		int r;
+
+		/* skipped or failed at preparation: already accounted for */
+		if (it->err[STAGE_DENOISE] != IMG_OK)
+			continue;
+
+		ts = omp_get_wtime();
+		r = gpu_denoise(&it->job, &set->gpu_time);
+		if (r == IMG_ERR_UNSUPPORTED)
+			r = cpu_fallback(&it->job, it->img.width, set->denoise.params.patch);
+
+		if (r == IMG_OK) {
+			nlm_job_finish(&it->job, &out);
+			image_free(&it->img);
+			it->img = out;
+		} else {
+			nlm_job_discard(&it->job);
+			failed++;
+		}
+
+		it->time_s[STAGE_DENOISE] += omp_get_wtime() - ts;
+		it->err[STAGE_DENOISE] = r;
+		progress_add(progress, it->units);
+	}
+
+	stage_done(set, STAGE_DENOISE, omp_get_wtime() - t0);
+
+	if (failed && !set->quiet) {
+		progress_clear(progress);
+		report_failures(set, STAGE_DENOISE, first, last);
 	}
 
 	return failed;
@@ -923,6 +1368,7 @@ io_release(ImageSet *set, size_t first, size_t last)
 		set->items[i].buf = NULL;
 		set->items[i].buf_len = 0;
 		image_free(&set->items[i].img);
+		nlm_job_discard(&set->items[i].job);
 	}
 }
 
@@ -959,36 +1405,31 @@ io_reset(ImageSet *set)
 		set->performed[s] = 0;
 		set->wall_time_s[s] = 0.0;
 	}
+
+	memset(&set->gpu_time, 0, sizeof(set->gpu_time));
 }
 
 /**
- * @brief Returns the name of a parallelization mode ("auto", "image", "pixel").
+ * @brief Progress units of one image over the stages that will run.
  *
- * @param[in] mode PAR_* value.
+ * Every I/O and codec stage counts 1 unit per image, and denoising counts
+ * nlm_units() (the number of search offsets, 440 with the defaults), which
+ * reflects that it dominates the run time.
  *
- * @return Static name string.
+ * @param[in] set   Image set (its denoise configuration is used).
+ * @param[in] write Non-zero if the encode and write stages will run.
+ *
+ * @return Units per image.
  */
-const char*
-io_mode_name(int mode)
+size_t
+io_progress_units(const ImageSet *set, int write)
 {
-	return (mode >= 0 && mode < PAR_COUNT) ? mode_names[mode] : "unknown";
-}
+	size_t u = 2 + (write ? 2 : 0);
 
-/**
- * @brief Parses a parallelization mode name.
- *
- * @param[in] name Mode name.
- *
- * @return PAR_* value, or -1 if unknown.
- */
-int
-io_mode_from_name(const char *name)
-{
-	for (int m = 0; m < PAR_COUNT; m++)
-		if (name && strcmp(name, mode_names[m]) == 0)
-			return m;
+	if (set->denoise.enabled)
+		u += nlm_units(&set->denoise.params);
 
-	return -1;
+	return u;
 }
 
 /**

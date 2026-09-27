@@ -10,14 +10,13 @@
  * Reads an image or a directory of images, optionally denoises them with
  * Non-Local Means, and optionally writes the results. Images are processed
  * in batches to bound memory use; within a batch, every stage is
- * parallelized with OpenMP, across images or, for the filters, optionally
- * within each image. Timings can be written as JSON for
+ * parallelized with OpenMP, across images, and denoising also within them.
+ * With -g, denoising runs on the GPU (CUDA), pipelined with the CPU stages. Timings can be written as JSON for
  * benchmarking.
  *
  * Usage: ./imgfilter [-o output] [-f format] [-t threads] [-B batch]
  *                    [-b bench.json [-n trials] [-w wtrials]] [-p]
- *                    [-d [-P patch] [-S search] [-H k] [-N sigma] [-A method]
- *                        [-m mode]] <input>
+ *                    [-d [-g] [-P patch] [-S search] [-H k] [-N sigma]] <input>
  */
 
 #include <omp.h>
@@ -28,6 +27,7 @@
 #include "args.h"
 #include "benchmark.h"
 #include "error.h"
+#include "gpu.h"
 #include "image.h"
 #include "io.h"
 #include "progress.h"
@@ -52,8 +52,6 @@
 #define DEFAULT_NLM_SEARCH 10   /* 21x21 search window */
 #define DEFAULT_NLM_H      0.4  /* h = 0.4 * sigma */
 #define DEFAULT_NLM_SIGMA  -1.0 /* estimate per image */
-#define DEFAULT_NLM_METHOD NLM_INTEGRAL
-#define DEFAULT_MODE       PAR_AUTO
 
 /* ------------------------------------------------------------------------- */
 /*                            Static Helper Functions                        */
@@ -68,7 +66,7 @@
  * @param[in,out] set      Image set (reset by the caller).
  * @param[in]     batch    Images per batch.
  * @param[in]     write    Non-zero to encode and write the results.
- * @param[in,out] progress Progress bar, one step per image and stage.
+ * @param[in,out] progress Progress bar (see io_progress_units()).
  *
  * @return Number of stage failures.
  */
@@ -105,6 +103,101 @@ run_pipeline(ImageSet *set, size_t batch, int write, Progress *progress)
 	return failed;
 }
 
+/**
+ * @brief Batch [first, last) of batch number @p b.
+ */
+static void
+batch_range(const ImageSet *set, size_t batch, size_t b, size_t *first, size_t *last)
+{
+	*first = b * batch;
+	*last = (*first + batch < set->count) ? *first + batch : set->count;
+}
+
+/**
+ * @brief GPU pipeline, CPU part: loads and prepares batch @p b.
+ */
+static size_t
+gpu_load(ImageSet *set, size_t batch, size_t b, Progress *progress)
+{
+	size_t first, last, failed = 0;
+
+	batch_range(set, batch, b, &first, &last);
+	failed += io_run(set, STAGE_READ, first, last, progress);
+	failed += io_run(set, STAGE_DECODE, first, last, progress);
+	failed += io_prepare(set, first, last, progress);
+	return failed;
+}
+
+/**
+ * @brief GPU pipeline, CPU part: saves and releases batch @p b.
+ */
+static size_t
+gpu_store(ImageSet *set, size_t batch, size_t b, int write, Progress *progress)
+{
+	size_t first, last, failed = 0;
+
+	batch_range(set, batch, b, &first, &last);
+	if (write) {
+		failed += io_run(set, STAGE_ENCODE, first, last, progress);
+		failed += io_run(set, STAGE_WRITE, first, last, progress);
+	}
+	io_release(set, first, last);
+	return failed;
+}
+
+/**
+ * @brief Runs the pipeline once with denoising on the GPU.
+ *
+ * Three batches are in flight at a time: while the GPU denoises batch k,
+ * the CPU loads and prepares batch k+1 and encodes and writes batch k-1.
+ * Two OpenMP sections run side by side; the GPU one is a single thread that
+ * sleeps while waiting for the GPU, the CPU one uses all threads in its own
+ * (nested) parallel regions.
+ *
+ * @param[in,out] set      Image set (reset by the caller).
+ * @param[in]     batch    Images per batch.
+ * @param[in]     write    Non-zero to encode and write the results.
+ * @param[in,out] progress Progress bar (see io_progress_units()).
+ *
+ * @return Number of stage failures.
+ */
+static size_t
+run_pipeline_gpu(ImageSet *set, size_t batch, int write, Progress *progress)
+{
+	const size_t nb = (set->count + batch - 1) / batch;
+	size_t failed;
+
+	failed = gpu_load(set, batch, 0, progress);
+
+	for (size_t b = 0; b < nb; b++) {
+		size_t f_gpu = 0, f_cpu = 0;
+
+		#pragma omp parallel sections num_threads(2)
+		{
+			#pragma omp section
+			{
+				size_t first, last;
+
+				batch_range(set, batch, b, &first, &last);
+				f_gpu = io_gpu_denoise(set, first, last, progress);
+			}
+
+			#pragma omp section
+			{
+				if (b + 1 < nb)
+					f_cpu += gpu_load(set, batch, b + 1, progress);
+				if (b > 0)
+					f_cpu += gpu_store(set, batch, b - 1, write, progress);
+			}
+		}
+
+		failed += f_gpu + f_cpu;
+	}
+
+	failed += gpu_store(set, batch, nb - 1, write, progress);
+	return failed;
+}
+
 /* ------------------------------------------------------------------------- */
 /*                                Main Function                              */
 /* ------------------------------------------------------------------------- */
@@ -126,11 +219,14 @@ int
 main(int argc, char *argv[])
 {
 	ImageSet set;
+	GpuInfo gpu_info;
+	int gpu_ready = 0;
 	Benchmark *bench = NULL;
 	Progress progress;
 	size_t failed = 0, batch, batches;
 	unsigned int runs;
-	int stages, ret = 1;
+	size_t units;
+	int ret = 1;
 
 	/* Command-line arguments with defaults */
 	Args args = {
@@ -144,13 +240,12 @@ main(int argc, char *argv[])
 		.wtrials    = DEFAULT_WTRIALS,
 		.progress   = DEFAULT_PROGRESS,
 		.denoise    = 0,
-		.mode       = DEFAULT_MODE,
+		.gpu        = 0,
 		.nlm        = {
 			.patch    = DEFAULT_NLM_PATCH,
 			.search   = DEFAULT_NLM_SEARCH,
 			.h_factor = DEFAULT_NLM_H,
 			.sigma    = DEFAULT_NLM_SIGMA,
-			.method   = DEFAULT_NLM_METHOD,
 		},
 	};
 
@@ -176,13 +271,20 @@ main(int argc, char *argv[])
 
 	omp_set_num_threads((int)args.threads);
 
+	/* GPU pipeline: the CPU section runs its own parallel regions */
+	if (args.gpu) {
+		if (gpu_init(&gpu_info))
+			goto cleanup;
+		gpu_ready = 1;
+		omp_set_max_active_levels(2);
+	}
+
 	/* Resolve input/output paths, output format, and list the images */
 	if (io_resolve(args.input, args.output, args.format, &set))
 		goto cleanup;
 
 	/* Filter configuration */
 	set.denoise.enabled = args.denoise;
-	set.denoise.mode = args.mode;
 	set.denoise.params = args.nlm;
 
 	/* Batch size: 0 means the whole set at once */
@@ -195,10 +297,12 @@ main(int argc, char *argv[])
 		                       args.wtrials, batch, batches, set.count, &set.denoise);
 		if (!bench)
 			goto cleanup;
+		if (gpu_ready)
+			benchmark_set_gpu(bench, &gpu_info);
 	}
 
-	/* One progress step per image and stage */
-	stages = 2 + (args.denoise ? 1 : 0) + (args.output ? 2 : 0);
+	/* Progress units per image, weighted by the cost of the stages */
+	units = io_progress_units(&set, args.output != NULL);
 	runs = args.wtrials + args.trials;
 
 	for (unsigned int r = 0; r < runs; r++) {
@@ -217,14 +321,15 @@ main(int argc, char *argv[])
 		io_reset(&set);
 		set.quiet = (r > 0); /* failures repeat every run: report them once */
 
-		progress_init(&progress, label, set.count * (size_t)stages,
-		              (size_t)stages, args.progress);
+		progress_init(&progress, label, set.count * units, units, args.progress);
 		progress_set(&progress, NULL, note);
 
 		if (bench && timed)
 			benchmark_trial_start(bench);
 
-		run_failed = run_pipeline(&set, batch, args.output != NULL, &progress);
+		run_failed = args.gpu
+			? run_pipeline_gpu(&set, batch, args.output != NULL, &progress)
+			: run_pipeline(&set, batch, args.output != NULL, &progress);
 
 		if (bench && timed && benchmark_trial_end(bench, &set))
 			goto cleanup;
@@ -243,6 +348,8 @@ main(int argc, char *argv[])
 	ret = failed ? 1 : 0;
 
 cleanup:
+	if (gpu_ready)
+		gpu_shutdown();
 	benchmark_free(bench);
 	io_free(&set);
 	return ret;

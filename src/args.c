@@ -24,7 +24,6 @@
 #include "args.h"
 #include "error.h"
 #include "image.h"
-#include "io.h"
 
 /* Largest accepted NLM radii; beyond these the cost explodes for no gain */
 #define MAX_PATCH_RADIUS  10
@@ -63,16 +62,12 @@ usage(void)
 		"  -h                 Show this help message and exit\n\n"
 		"Denoising (Non-Local Means):\n"
 		"  -d                 Enable denoising\n"
+		"  -g                 Denoise on the GPU (CUDA); the CPU reads, decodes,\n"
+		"                     encodes and writes other batches meanwhile\n"
 		"  -P <radius>        Patch radius, patches are (2r+1)^2   (default: 2)\n"
 		"  -S <radius>        Search radius, window is (2r+1)^2    (default: 10)\n"
 		"  -H <k>             Strength, h = k * sigma              (default: 0.4)\n"
-		"  -N <sigma>         Noise standard deviation (default: estimated per image)\n"
-		"  -A <method>        Patch distances: integral or direct (default: integral)\n"
-		"                       same output; integral cost does not grow with -P\n"
-		"  -m <mode>          Parallelization of the filter     (default: auto)\n"
-		"                       image  threads over images, each filtered serially\n"
-		"                       pixel  images in turn, threads over the rows\n"
-		"                       auto   image if a batch has an image per thread\n\n"
+		"  -N <sigma>         Noise standard deviation (default: estimated per image)\n\n"
 		"Arguments:\n"
 		"  input              Image or directory of images\n"
 		"                     (PGM, PNG, JPEG, BMP, TGA; converted to grayscale)\n\n"
@@ -85,8 +80,9 @@ usage(void)
 		"Examples:\n"
 		"  %s -t 8 -o out/ data/\n"
 		"  %s -p -b results.json -f png -o out/ data/\n"
-		"  %s -d -P 3 -S 7 -m pixel -o clean.pgm noisy.png\n",
-		program_name, program_name, program_name, program_name
+		"  %s -d -P 3 -S 7 -o clean.pgm noisy.png\n"
+		"  %s -d -g -p -o clean/ xrays/\n",
+		program_name, program_name, program_name, program_name, program_name
 	);
 
 	free(program_name);
@@ -198,12 +194,11 @@ bad_opt(int opt, int is_missing_arg)
  *   -w <wtrials>  Warmup benchmark trials (requires -b)
  *   -p            Show progress bars
  *   -d            Denoise with Non-Local Means
+ *   -g            Denoise on the GPU (CUDA), pipelined with the CPU stages
  *   -P <radius>   NLM patch radius
  *   -S <radius>   NLM search radius
  *   -H <k>        NLM strength, h = k * sigma
  *   -N <sigma>    NLM noise standard deviation (default: estimated per image)
- *   -A <method>   NLM method: integral or direct
- *   -m <mode>     Filter parallelization: auto, image or pixel
  *   -h            Show usage and exit
  *
  * Required argument:
@@ -227,7 +222,7 @@ parse_args(int argc, char *argv[], Args *args)
 
 	opterr = 0;
 
-	while ((opt = getopt(argc, argv, "o:f:t:B:b:n:w:pdP:S:H:N:A:m:h")) != -1) {
+	while ((opt = getopt(argc, argv, "o:f:t:B:b:n:w:pdgP:S:H:N:h")) != -1) {
 		switch (opt) {
 		case 'o':
 			args->output = optarg;
@@ -300,6 +295,11 @@ parse_args(int argc, char *argv[], Args *args)
 			args->denoise = 1;
 			break;
 
+		case 'g':
+			args->gpu = 1;
+			nlm_opt = 1;
+			break;
+
 		case 'P': {
 			unsigned int v;
 			if (!parse_uint(optarg, &v))
@@ -346,30 +346,6 @@ parse_args(int argc, char *argv[], Args *args)
 			break;
 		}
 
-		case 'A': {
-			int m = nlm_method_from_name(optarg);
-			if (m < 0) {
-				uerrf("unknown method '%s' (use integral or direct)", optarg);
-				usage();
-				return 1;
-			}
-			args->nlm.method = m;
-			nlm_opt = 1;
-			break;
-		}
-
-		case 'm': {
-			int m = io_mode_from_name(optarg);
-			if (m < 0) {
-				uerrf("unknown mode '%s' (use auto, image or pixel)", optarg);
-				usage();
-				return 1;
-			}
-			args->mode = m;
-			nlm_opt = 1;
-			break;
-		}
-
 		case 'h':
 			usage();
 			return -1;
@@ -378,8 +354,7 @@ parse_args(int argc, char *argv[], Args *args)
 		default:
 			if (optopt == 'o' || optopt == 'f' || optopt == 't' || optopt == 'B'
 			    || optopt == 'b' || optopt == 'n' || optopt == 'w' || optopt == 'P'
-			    || optopt == 'S' || optopt == 'H' || optopt == 'N' || optopt == 'A'
-			    || optopt == 'm')
+			    || optopt == 'S' || optopt == 'H' || optopt == 'N')
 				return bad_opt(optopt, 1);
 			return bad_opt(optopt ? optopt : '?', 0);
 		}
@@ -387,7 +362,7 @@ parse_args(int argc, char *argv[], Args *args)
 
 	/* Filter options without the filter are almost certainly a mistake */
 	if (nlm_opt && !args->denoise) {
-		uerrf("-P, -S, -H, -N, -A and -m require -d");
+		uerrf("-g, -P, -S, -H and -N require -d");
 		usage();
 		return 1;
 	}

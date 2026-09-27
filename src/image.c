@@ -613,7 +613,8 @@ image_strerror(int err, int sys_errno)
 	case IMG_ERR_SIZE:        return "invalid image dimensions";
 	case IMG_ERR_TRUNC:       return "unexpected end of data";
 	case IMG_ERR_NOMEM:       return "out of memory";
-	case IMG_ERR_UNSUPPORTED: return "format cannot be written";
+	case IMG_ERR_UNSUPPORTED: return "not supported";
+	case IMG_ERR_GPU:         return "GPU error";
 	default:                  return "unknown error";
 	}
 }
