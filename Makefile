@@ -2,14 +2,11 @@ PROJECT ?= imgfilter
 
 CC   ?= gcc
 
-# ---------- Directories ----------
 SRC_DIR ?= src
 EXT_DIR ?= $(SRC_DIR)/external
 OBJ_DIR ?= obj
 BIN_DIR ?= bin
 
-# ---------- CUDA location ----------
-# Try to auto-detect CUDA from nvcc in PATH first, then fall back to common locations
 ifndef CUDA_HOME
   NVCC_PATH := $(shell which nvcc 2>/dev/null)
   ifneq ($(NVCC_PATH),)
@@ -28,16 +25,6 @@ NVCC ?= $(if $(CUDA_HOME),$(CUDA_HOME)/bin/nvcc,nvcc)
 # build (gpu_none.c replaces gpu.cu and -g reports that CUDA is unavailable).
 CUDA ?= $(if $(shell command -v $(NVCC) 2>/dev/null),1,0)
 
-# ---------- CUDA architecture ----------
-#
-# Native SASS (sm_XX) is compiled for the detected/selected GPU, so that the
-# kernel does not depend on the driver's PTX JIT.
-#
-# Usage:
-#   make                  # auto-detect GPU, fallback to T4 (sm_75)
-#   make GPU_ARCH=86      # override (e.g., RTX 3060)
-#   make GPU_ARCHES="75 86"  # build fat binary for multiple GPUs
-
 GPU_ARCH_DETECTED := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -d '.')
 GPU_ARCH ?= $(if $(GPU_ARCH_DETECTED),$(GPU_ARCH_DETECTED),75)
 GPU_ARCHES ?= $(GPU_ARCH)
@@ -45,17 +32,14 @@ GPU_ARCHES ?= $(GPU_ARCH)
 NVCC_GENCODE :=
 $(foreach arch,$(GPU_ARCHES),$(eval NVCC_GENCODE += -gencode arch=compute_$(arch),code=sm_$(arch)))
 
-# ---------- Flags ----------
 CPPFLAGS ?=
 CFLAGS   ?= -Wall -Wextra -Wpedantic -O3 -fopenmp
 LDFLAGS  ?= -fopenmp
 LDLIBS   ?= -lm
 
-# Vendored third-party code (stb): optimized, but not held to our warnings
 EXT_CFLAGS ?= -O3 -w
 
-# CUDA: no fused multiply-add (and no fast math), so that the GPU performs
-# exactly the CPU's floating-point operations and the outputs are identical.
+# no fused multiply-add, so the GPU's results match the CPU's bit for bit
 NVCCFLAGS ?= -O3 -fmad=false $(NVCC_GENCODE)
 
 # Add include paths
@@ -64,12 +48,10 @@ CPPFLAGS += -I$(SRC_DIR)
 # Dependency generation
 DEPFLAGS := -MMD -MP
 
-# ---------- Sources ----------
 C_SRCS   := $(wildcard $(SRC_DIR)/*.c)
 CU_SRCS  := $(wildcard $(SRC_DIR)/*.cu)
 EXT_SRCS := $(wildcard $(EXT_DIR)/*.c)
 
-# gpu.cu with CUDA, its stub gpu_none.c without
 ifeq ($(CUDA),1)
   C_SRCS := $(filter-out $(SRC_DIR)/gpu_none.c,$(C_SRCS))
 else
@@ -81,7 +63,6 @@ CU_OBJS  := $(CU_SRCS:$(SRC_DIR)/%.cu=$(OBJ_DIR)/%.cu.o)
 EXT_OBJS := $(EXT_SRCS:$(EXT_DIR)/%.c=$(OBJ_DIR)/external/%.o)
 OBJS     := $(C_OBJS) $(CU_OBJS) $(EXT_OBJS)
 
-# Link with nvcc when CUDA code is present (it adds the CUDA runtime)
 ifeq ($(CUDA),1)
   LINK       := $(NVCC)
   LINK_FLAGS := $(NVCC_GENCODE) -Xcompiler=-fopenmp $(LDLIBS)
@@ -92,14 +73,11 @@ endif
 
 TARGET ?= $(BIN_DIR)/$(PROJECT)
 
-# The generated .d files contain rules; without this, the first of them
-# would become the default goal and a plain `make` would stop relinking.
 .DEFAULT_GOAL := all
 
 DEPS := $(OBJS:.o=.d)
 -include $(DEPS)
 
-# ---------- Pretty output (optional colors) ----------
 PRINTF ?= printf
 ifeq ($(NO_COLOR),1)
   COLOR_RESET   :=
@@ -119,7 +97,6 @@ else
   COLOR_CYAN    := \033[1;36m
 endif
 
-# ---------- Rules ----------
 .PHONY: all clean rebuild help
 all: $(TARGET)
 
@@ -131,17 +108,14 @@ $(TARGET): $(OBJS) | $(BIN_DIR)
 	@$(LINK) -o $@ $(OBJS) $(LINK_FLAGS)
 	@$(PRINTF) "$(COLOR_CYAN)Build complete!$(COLOR_RESET)\n"
 
-# C objects
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
 	@$(PRINTF) "$(COLOR_BLUE)Compiling C:$(COLOR_RESET) %s\n" "$<"
 	@$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
-# CUDA objects
 $(OBJ_DIR)/%.cu.o: $(SRC_DIR)/%.cu | $(OBJ_DIR)
 	@$(PRINTF) "$(COLOR_MAGENTA)Compiling CUDA:$(COLOR_RESET) %s\n" "$<"
 	@$(NVCC) $(CPPFLAGS) $(NVCCFLAGS) -MMD -MP -c $< -o $@
 
-# Third-party objects
 $(OBJ_DIR)/external/%.o: $(EXT_DIR)/%.c | $(OBJ_DIR)/external
 	@$(PRINTF) "$(COLOR_MAGENTA)Compiling external:$(COLOR_RESET) %s\n" "$<"
 	@$(CC) $(CPPFLAGS) $(EXT_CFLAGS) $(DEPFLAGS) -c $< -o $@

@@ -1,38 +1,13 @@
 /**
  * @file gpu.cu
- * @brief CUDA implementation of NLM denoising and Canny edge detection.
+ * @brief NLM denoising and Canny edge detection in CUDA.
  *
- * Images are processed in two alternating slots, each with its own stream,
- * so that the copies of one image overlap with the kernels of another.
- *
- * This is the only CUDA translation unit; everything else is C. It contains
- * the kernel and thin wrappers with C linkage (see gpu.h).
- *
- * Kernel design: blocks of BLOCK_W x BLOCK_H threads, each thread computing
- * PIX_Y vertically adjacent output pixels. A block loads its tile of the
- * padded image, plus a border of patch + search radius, into shared memory
- * once. It then processes the offsets of the search window GROUP at a
- * time: all threads compute the horizontal patch sums of the group's
- * offsets straight from the image tile (a sliding window over squared
- * differences held in registers), and after a barrier every thread sums
- * its columns over the patch height, sliding down from one of its pixels
- * to the next. That is each pixel's exact integer patch sum, the same value
- * the CPU obtains from integral images. Weights are read from the table
- * built by the CPU, and every thread keeps its accumulators in registers
- * for the whole loop, so they cost no memory traffic.
- *
- * The kernel is a template over the patch radius (instantiated for every
- * radius the program accepts), so that the sliding window is a register
- * array and every division in the loops is by a constant.
- *
- * Offsets are visited in the same order as on the CPU and the arithmetic is
- * the same, and the file is compiled without fused multiply-add
- * (-fmad=false), so the output is bit-for-bit identical to the CPU's.
- *
- * The phases of the kernel are __host__ __device__ functions of a tile and a
- * thread position, so that they can also be executed on the host (one
- * thread after the other, phase by phase) to test the kernel's indexing
- * without a GPU.
+ * NLM: each block loads its image tile (plus the P + S border) into shared
+ * memory once, then walks the search offsets GROUP at a time. All threads
+ * compute the horizontal patch sums of the group straight from the tile;
+ * after a barrier each thread slides a vertical window down its PIX_Y
+ * pixels. Those are the CPU's exact integer patch sums, and the weights
+ * come from the CPU's table, so with -fmad=false the output is identical.
  */
 
 #include <cuda_runtime.h>
@@ -40,7 +15,6 @@
 #include <stdio.h>
 #include <string.h>
 
-/* project headers are C: give their declarations C linkage */
 extern "C" {
 #include "canny.h"
 #include "error.h"
@@ -49,10 +23,8 @@ extern "C" {
 #include "gpu.h"
 
 /*
- * Block shape: BLOCK_W x BLOCK_H threads, each computing PIX_Y vertically
- * adjacent output pixels, so a block covers a tile of TILE_W x TILE_H
- * pixels. Taller tiles make the patch border (2P rows of extra horizontal
- * sums) a smaller share of the work.
+ * Each thread computes PIX_Y vertically adjacent pixels. Taller tiles make
+ * the 2P rows of extra horizontal sums a smaller share.
  */
 #define BLOCK_W 32
 #define BLOCK_H 16
@@ -61,42 +33,29 @@ extern "C" {
 #define TILE_H  (BLOCK_H * PIX_Y)
 
 /*
- * GROUP offsets are processed per barrier round; the number of offsets,
- * 4 S (S + 1), is a multiple of 8 for every S, so GROUP = 4 divides it.
- * SEG horizontal sums are computed per work item, sliding a window over
- * SEG + 2P squared differences held in registers.
+ * GROUP offsets per barrier round (4 S (S + 1) is a multiple of 8). Each
+ * work item computes SEG horizontal sums, sliding over SEG + 2P squared
+ * differences held in registers.
  */
 #define GROUP 4
 #define SEG   4
 
-/* Largest patch radius with a kernel instantiation (the program's limit) */
+/* the program's largest patch radius */
 #define MAX_P 10
 
-/**
- * @struct Tile
- * @brief Shared-memory layout of one block.
- */
 struct Tile {
-	unsigned char *img; /**< Padded image tile: sh x sw bytes */
-	int *hsum;          /**< Horizontal patch sums: GROUP x dh x TILE_W */
-	int sw, sh;         /**< Image tile size (tile + 2 (P + S)) */
-	int s;              /**< Search radius */
+	unsigned char *img;
+	int *hsum;          /* GROUP x dh x TILE_W */
+	int sw, sh;
+	int s;
 };
 
-/* ------------------------------------------------------------------------- */
-/*                               Kernel Phases                               */
-/* ------------------------------------------------------------------------- */
-
 /*
- * The phases are templates over the patch radius P, so that the sliding
- * window lives in registers and every division is by a constant. They take
- * the thread's index in the block (or position) and can also be executed on
- * the host, one thread after the other, to test the indexing without a GPU.
+ * Templates over P, so that the sliding window lives in registers and every
+ * division is by a constant. They are also __host__, so that they can be
+ * tested on the CPU, one thread after the other.
  */
 
-/**
- * @brief Bytes of shared memory needed by one block.
- */
 __host__ __device__ static inline size_t
 tile_bytes(int p, int s)
 {
@@ -108,9 +67,6 @@ tile_bytes(int p, int s)
 	return img + hs * sizeof(int);
 }
 
-/**
- * @brief Lays out a tile in @p smem.
- */
 __host__ __device__ static inline Tile
 tile_make(unsigned char *smem, int p, int s)
 {
@@ -128,10 +84,7 @@ tile_make(unsigned char *smem, int p, int s)
 	return t;
 }
 
-/**
- * @brief Phase 1: loads the block's padded image tile. Outside the padded
- *        image (right/bottom edge blocks), zeros.
- */
+/* Beyond the padded image (right/bottom blocks): zeros. */
 __host__ __device__ static inline void
 tile_load(const Tile *t, const unsigned char *pad, int pw, int ph,
           int x0, int y0, int tx, int ty)
@@ -146,11 +99,7 @@ tile_load(const Tile *t, const unsigned char *pad, int pw, int ph,
 	}
 }
 
-/**
- * @brief The next GROUP offsets in raster order, skipping the center.
- *
- * (*cx, *cy) is the running position in the search window.
- */
+/* (*cx, *cy): running position in the search window, center skipped */
 __host__ __device__ static inline void
 next_offsets(int s, int sw, int *cx, int *cy, int dx[GROUP], int dy[GROUP], int shift[GROUP])
 {
@@ -165,16 +114,7 @@ next_offsets(int s, int sw, int *cx, int *cy, int dx[GROUP], int dy[GROUP], int 
 	}
 }
 
-/**
- * @brief Phase 2: horizontal patch sums of GROUP offsets, straight from the
- *        image tile.
- *
- * A work item is (offset k, row r, SEG consecutive columns). Its SEG + 2P
- * squared differences are computed once into registers, and the SEG sums
- * of 2P + 1 of them are obtained by sliding a window. Row r corresponds to
- * image tile row r + S, column x to image tile column x + S; the sum for
- * (k, r, x) covers columns x .. x + 2P.
- */
+/* A work item: offset k, row r, SEG columns. Row r is image tile row r + S. */
 template <int P>
 __host__ __device__ static inline void
 tile_hsum(const Tile *t, const int shift[GROUP], int tid, int nt)
@@ -214,12 +154,7 @@ tile_hsum(const Tile *t, const int shift[GROUP], int tid, int nt)
 	}
 }
 
-/**
- * @brief Phase 3 (per thread): the patch sums of the thread's PIX_Y pixels
- *        for offset k of the group, rows ty * PIX_Y ... of column tx, from
- *        2P+1 vertically adjacent horizontal sums. The window slides down
- *        one row per pixel.
- */
+/* The thread's PIX_Y patch sums for offset k, sliding the window down. */
 template <int P>
 __host__ __device__ static inline void
 tile_patch(const Tile *t, int k, int tx, int ty, int ssd[PIX_Y])
@@ -241,10 +176,6 @@ tile_patch(const Tile *t, int k, int tx, int ty, int ssd[PIX_Y])
 	}
 }
 
-/**
- * @brief Adds a candidate to a pixel's accumulators (same arithmetic and
- *        order as the CPU).
- */
 __host__ __device__ static inline void
 accumulate(float w, unsigned char q, float *wsum, float *vsum, float *wmax)
 {
@@ -254,10 +185,7 @@ accumulate(float w, unsigned char q, float *wsum, float *vsum, float *wmax)
 		*wmax = w;
 }
 
-/**
- * @brief Final value of a pixel (same as the CPU): the center counts as
- *        much as its most similar neighbor.
- */
+/* The center counts as much as its most similar neighbor, as on the CPU. */
 __host__ __device__ static inline unsigned char
 finish(float wsum, float vsum, float wmax, unsigned char center)
 {
@@ -272,28 +200,6 @@ finish(float wsum, float vsum, float wmax, unsigned char center)
 	return (unsigned char)(value < 0 ? 0 : value > 255 ? 255 : value);
 }
 
-/* ------------------------------------------------------------------------- */
-/*                                  Kernel                                   */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief NLM kernel: every thread computes PIX_Y pixels over all offsets.
- *
- * Offsets are processed GROUP at a time, in raster order skipping the
- * center (the same order as on the CPU): all threads compute the group's
- * horizontal sums, then every thread accumulates its pixels over the
- * group's offsets in order. Two barriers per group.
- *
- * @param pad    Mirrored, padded image ((H + 2R) x pw).
- * @param pw     Padded width.
- * @param ph     Padded height.
- * @param w      Image width.
- * @param h      Image height.
- * @param s      Search radius.
- * @param cutoff Largest patch sum with a non-negligible weight.
- * @param wtab   Weight per patch sum 0..cutoff.
- * @param out    Output image (w x h).
- */
 template <int P>
 __global__ void
 nlm_kernel(const unsigned char *__restrict__ pad, int pw, int ph, int w, int h,
@@ -322,7 +228,7 @@ nlm_kernel(const unsigned char *__restrict__ pad, int pw, int ph, int w, int h,
 		next_offsets(s, t.sw, &cx, &cy, dx, dy, shift);
 
 		tile_hsum<P>(&t, shift, tid, nt);
-		__syncthreads();                /* horizontal sums of the group complete */
+		__syncthreads();
 
 		for (int k = 0; k < GROUP; k++) {
 			int ssd[PIX_Y];
@@ -347,9 +253,6 @@ nlm_kernel(const unsigned char *__restrict__ pad, int pw, int ph, int w, int h,
 	}
 }
 
-/**
- * @brief Launches the kernel instantiation for patch radius P.
- */
 template <int P>
 static cudaError_t
 launch(dim3 grid, dim3 block, size_t smem, cudaStream_t stream, const unsigned char *pad,
@@ -367,26 +270,14 @@ launch(dim3 grid, dim3 block, size_t smem, cudaStream_t stream, const unsigned c
 	return cudaGetLastError();
 }
 
-/* ------------------------------------------------------------------------- */
-/*                              Canny Kernels                                */
-/* ------------------------------------------------------------------------- */
-
-/*
- * The per-pixel steps call the same functions as the CPU (canny_core.h).
- * Hysteresis uses tiles of HYST_T x HYST_T pixels, each thread handling
- * HYST_T / HYST_ROWS pixels of a column.
- */
+/* Hysteresis tiles: HYST_T x HYST_T, HYST_T / HYST_ROWS rows per thread. */
 #define CANNY_BW  32
 #define CANNY_BH  8
 #define HYST_T    32
 #define HYST_ROWS 8
 
-/* Gaussian weights of the current image */
 __constant__ int c_weights[2 * CANNY_MAX_RADIUS + 1];
 
-/**
- * @brief Horizontal Gaussian pass, one thread per pixel.
- */
 __global__ void
 canny_blur_h_kernel(const unsigned char *__restrict__ img, int *__restrict__ hb,
                     int w, int h, int r)
@@ -398,9 +289,6 @@ canny_blur_h_kernel(const unsigned char *__restrict__ img, int *__restrict__ hb,
 		hb[(size_t)y * w + x] = canny_blur_h(img, w, x, y, c_weights, r);
 }
 
-/**
- * @brief Vertical Gaussian pass, one thread per pixel.
- */
 __global__ void
 canny_blur_v_kernel(const int *__restrict__ hb, int *__restrict__ b, int w, int h, int r)
 {
@@ -411,10 +299,6 @@ canny_blur_v_kernel(const int *__restrict__ hb, int *__restrict__ b, int w, int 
 		b[(size_t)y * w + x] = canny_blur_v(hb, 0, w, h, x, y, c_weights, r);
 }
 
-/**
- * @brief Gradients, non-maximum suppression and thresholds, one thread per
- *        pixel: the class map (none / weak / edge).
- */
 __global__ void
 canny_classify_kernel(const int *__restrict__ b, unsigned char *__restrict__ map,
                       int w, int h, long long tl2, long long th2)
@@ -426,12 +310,7 @@ canny_classify_kernel(const int *__restrict__ b, unsigned char *__restrict__ map
 		map[(size_t)y * w + x] = canny_classify(b, 0, w, h, x, y, tl2, th2);
 }
 
-/**
- * @brief Hysteresis step for tile position (r, c) (1-based inside the halo):
- *        a weak pixel next to an edge becomes an edge.
- *
- * @return 1 if the pixel changed.
- */
+/* (r, c) is 1-based inside the tile's halo. */
 __host__ __device__ static inline int
 hyst_relax(unsigned char s[HYST_T + 2][HYST_T + 2], int r, int c)
 {
@@ -448,11 +327,7 @@ hyst_relax(unsigned char s[HYST_T + 2][HYST_T + 2], int r, int c)
 	return 0;
 }
 
-/*
- * Which of a tile's border pixels changed, as bits: a change on a side of
- * the tile can affect the neighboring tile on that side, a change in a
- * corner pixel also the diagonal neighbor. Changes inside affect no one.
- */
+/* A changed border pixel affects the neighbor on that side (corner: diagonal). */
 #define BORDER_TOP    0x01
 #define BORDER_BOTTOM 0x02
 #define BORDER_LEFT   0x04
@@ -462,9 +337,6 @@ hyst_relax(unsigned char s[HYST_T + 2][HYST_T + 2], int r, int c)
 #define BORDER_BL     0x40
 #define BORDER_BR     0x80
 
-/**
- * @brief Border bits of tile position (r, c) (1-based inside the halo).
- */
 __host__ __device__ static inline int
 hyst_border_bits(int r, int c)
 {
@@ -481,10 +353,6 @@ hyst_border_bits(int r, int c)
 	return bits;
 }
 
-/**
- * @brief Marks the neighbors of tile (bx, by) that its changed border
- *        pixels (@p bits) can affect, for the next launch.
- */
 __host__ __device__ static inline void
 hyst_mark(unsigned char *next, int tiles_x, int tiles_y, int bx, int by, int bits)
 {
@@ -500,25 +368,12 @@ hyst_mark(unsigned char *next, int tiles_x, int tiles_y, int bx, int by, int bit
 	if ((bits & BORDER_BR) && down && right)   next[(by + 1) * tiles_x + bx + 1] = 1;
 }
 
-/**
- * @brief Hysteresis: propagates edges through weak pixels within each
- *        active tile until nothing changes.
- *
- * Only tiles marked in @p active do any work; the others return at once.
- * A tile that changed pixels on its border marks the neighbors those
- * pixels touch in @p next, the tiles to process in the next launch: a tile
- * can only have work left if a neighbor changed their shared border since
- * it last ran. The tile's 1-pixel border comes from the neighboring tiles
- * as they were when loaded; a neighbor changing it later in the same launch
- * marks the tile for the next one. The host relaunches until a launch
- * changes nothing, which is the unique fixed point: every weak pixel
- * connected to an edge is an edge, the same result as the CPU's flood fill.
- *
- * @param map       Class map (none / weak / edge), updated in place.
- * @param active    Tiles to process in this launch.
- * @param next      Tiles to process in the next launch (zeroed by the host).
- * @param changed   Set to 1 if any pixel changed (may be NULL).
- * @param processed Count of tiles processed (atomically incremented).
+/*
+ * Propagates edges through weak pixels within each active tile until
+ * nothing changes. A tile can only have work left if a neighbor changed
+ * their shared border, so only those are marked for the next launch. The
+ * host relaunches until a launch changes nothing: the unique fixed point,
+ * equal to the CPU's flood fill whatever the order.
  */
 __global__ void
 canny_hyst_kernel(unsigned char *__restrict__ map, int w, int h,
@@ -534,7 +389,7 @@ canny_hyst_kernel(unsigned char *__restrict__ map, int w, int h,
 	unsigned int mask = 0;
 	int any = 0;
 
-	/* the whole block decides together: no barrier has been reached yet */
+	/* uniform per block, before any barrier */
 	if (!active[by * tiles_x + bx])
 		return;
 
@@ -566,7 +421,6 @@ canny_hyst_kernel(unsigned char *__restrict__ map, int w, int h,
 		any = 1;
 	}
 
-	/* write back the pixels that changed, noting changed border pixels */
 	for (int k = 0; k < HYST_T / HYST_ROWS; k++) {
 		const int r = ty + k * HYST_ROWS + 1, c = tx + 1;
 		int bits;
@@ -588,9 +442,6 @@ canny_hyst_kernel(unsigned char *__restrict__ map, int w, int h,
 	}
 }
 
-/**
- * @brief Class map to edge map in place: 255 on edges, 0 elsewhere.
- */
 __global__ void
 canny_finish_kernel(unsigned char *__restrict__ map, size_t n)
 {
@@ -600,74 +451,49 @@ canny_finish_kernel(unsigned char *__restrict__ map, size_t n)
 		map[i] = (map[i] == CANNY_EDGE) ? 255 : 0;
 }
 
-/* ------------------------------------------------------------------------- */
-/*                                  Slots                                    */
-/* ------------------------------------------------------------------------- */
-
 /*
- * Images go through the GPU in two alternating slots, each with its own
- * stream, device buffers and pinned (page-locked) host buffers. While one
- * image's kernels run in one slot, the next image is uploaded and the
- * previous one downloaded in the other: copies from and to pinned memory
- * run asynchronously, overlapping with the kernels. Work within a slot is
- * ordered by its stream, which protects the slot's buffers.
+ * Two slots, each with its own stream, device buffers and pinned host
+ * buffers: while one image's kernels run, the other slot uploads the next
+ * image and downloads the previous one.
  */
 #define SLOTS 2
 
-/*
- * Events of an image, in start/end pairs recorded right around each piece
- * of work, so that time a stream spends waiting for the host between
- * pieces is not counted: upload, denoising kernel, per-pixel edge kernels,
- * one hysteresis launch group (reused per group), download.
- */
+/* Event pairs right around each piece of work, so waits between do not count. */
 enum {
 	EV_UP0, EV_UP1, EV_DN0, EV_DN1, EV_PX0, EV_PX1, EV_HY0, EV_HY1, EV_DL0, EV_DL1,
 	EV_COUNT
 };
 
 /*
- * Hysteresis launches per check of the "changed" flag. Reading the flag is
- * a synchronization with the GPU; launching a few kernels back to back and
- * checking only the last one saves most of them. Extra launches after
- * convergence find no active tile and cost almost nothing.
+ * Checking the "changed" flag waits for the GPU, so it is checked every
+ * HYST_GROUP launches; extra launches find no active tile and cost little.
  */
 #define HYST_GROUP 4
 
-/**
- * @struct Buf
- * @brief A buffer that grows on demand (device or pinned host memory).
- */
 struct Buf {
-	void *p;    /**< Memory */
-	size_t cap; /**< Size in bytes */
+	void *p;
+	size_t cap;
 };
 
-/**
- * @struct Slot
- * @brief One image in flight: stream, events, buffers, and its task.
- */
 struct Slot {
-	cudaStream_t stream;                   /**< Stream of the slot */
-	cudaEvent_t ev[EV_COUNT];              /**< Step boundaries of the image */
-	Buf d_pad, d_tab, d_out;               /**< Denoising, device */
-	Buf e_img, e_hb, e_b, e_map, e_act[2]; /**< Edges, device */
-	Buf e_flag;                            /**< Changed flag, tile counter */
-	Buf h_in, h_tab, h_out, h_flag;        /**< Pinned host staging */
-	GpuTask *task;                         /**< Image in flight, or NULL */
-	int denoise, edges;                    /**< Which filters run on it */
-	int launches;                          /**< Hysteresis launches */
-	double tiles_all;                      /**< Tiles in all its hysteresis launches */
-	double hyst_ms;                        /**< GPU time of its hysteresis groups */
-	int cur;                               /**< Active-tile array of the next launch */
-	int tiles_x, tiles_y;                  /**< Hysteresis tile grid */
+	cudaStream_t stream;
+	cudaEvent_t ev[EV_COUNT];
+	Buf d_pad, d_tab, d_out;
+	Buf e_img, e_hb, e_b, e_map, e_act[2];
+	Buf e_flag;                            /* changed flag, tile counter */
+	Buf h_in, h_tab, h_out, h_flag;        /* pinned */
+	GpuTask *task;
+	int denoise, edges;
+	int launches;
+	double tiles_all;
+	double hyst_ms;
+	int cur;                               /* active-tile array of the next launch */
+	int tiles_x, tiles_y;
 };
 
 static Slot slots[SLOTS];
 static int ready = 0;
 
-/**
- * @brief Reports a CUDA error. Returns 1 if @p err is an error.
- */
 static int
 cuda_failed(cudaError_t err, const char *what)
 {
@@ -677,9 +503,6 @@ cuda_failed(cudaError_t err, const char *what)
 	return 1;
 }
 
-/**
- * @brief Makes sure a device buffer holds at least @p need bytes.
- */
 static int
 dev_reserve(Buf *b, size_t need, const char *what)
 {
@@ -697,9 +520,6 @@ dev_reserve(Buf *b, size_t need, const char *what)
 	return 0;
 }
 
-/**
- * @brief Makes sure a pinned host buffer holds at least @p need bytes.
- */
 static int
 host_reserve(Buf *b, size_t need, const char *what)
 {
@@ -717,12 +537,7 @@ host_reserve(Buf *b, size_t need, const char *what)
 	return 0;
 }
 
-/**
- * @brief Width and height of a task's image.
- *
- * Taken from the image, which every task has: a job with nothing to denoise
- * (no noise) leaves its context unset.
- */
+/* From the image: a job with nothing to denoise leaves its context unset. */
 static void
 task_size(const GpuTask *t, int *w, int *h)
 {
@@ -730,18 +545,6 @@ task_size(const GpuTask *t, int *w, int *h)
 	*h = (int)t->img->height;
 }
 
-/* ------------------------------------------------------------------------- */
-/*                              Per-Slot Steps                               */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Step 1: copies a task's inputs to pinned memory and starts their
- *        upload. The slot must be free.
- *
- * Denoising uploads the padded image and the weight table; edge detection
- * alone uploads the image (a job without noise to remove already holds its
- * output, which is then the edge input).
- */
 static int
 slot_stage(Slot *s, GpuTask *t, int edges)
 {
@@ -780,7 +583,7 @@ slot_stage(Slot *s, GpuTask *t, int edges)
 		                                   s->stream), "upload (weights)"))
 			return IMG_ERR_GPU;
 	} else if (edges) {
-		/* edge input: the image, or the output of a job with nothing to denoise */
+		/* the image, or the output of a job with nothing to denoise */
 		const unsigned char *src = t->job ? t->job->out.data : t->img->data;
 
 		if (host_reserve(&s->h_in, n, "cudaHostAlloc (image)")
@@ -799,10 +602,6 @@ slot_stage(Slot *s, GpuTask *t, int edges)
 	return IMG_OK;
 }
 
-/**
- * @brief Step 2: launches the denoising kernel and the per-pixel edge
- *        kernels (asynchronous).
- */
 static int
 slot_kernels(Slot *s, const CannySetup *cs)
 {
@@ -823,7 +622,6 @@ slot_kernels(Slot *s, const CannySetup *cs)
 
 		cudaEventRecord(s->ev[EV_DN0], s->stream);
 
-		/* the patch radius is a template parameter: pick its instantiation */
 		switch (c->p) {
 #define CASE(P) case P: err = launch<P>(grid, block, smem, s->stream, (unsigned char *)s->d_pad.p, \
 		                                (int)c->pw, (int)c->h + 2 * r, (int)c->w, (int)c->h, c->s, \
@@ -842,7 +640,6 @@ slot_kernels(Slot *s, const CannySetup *cs)
 	if (s->edges) {
 		dim3 block(CANNY_BW, CANNY_BH);
 		dim3 grid((unsigned)((w + CANNY_BW - 1) / CANNY_BW), (unsigned)((h + CANNY_BH - 1) / CANNY_BH));
-		/* denoised on the GPU: the edge input is already there */
 		const unsigned char *src = s->denoise ? (unsigned char *)s->d_out.p : (unsigned char *)s->e_img.p;
 
 		if (dev_reserve(&s->e_hb, n * sizeof(int), "cudaMalloc (edges blur)")
@@ -864,13 +661,6 @@ slot_kernels(Slot *s, const CannySetup *cs)
 	return IMG_OK;
 }
 
-/**
- * @brief Enqueues one group of HYST_GROUP hysteresis launches, then the
- *        download of the flag and tile counter (asynchronous).
- *
- * The group is bracketed by the EV_HY0 / EV_HY1 events; its time is added
- * when the group is checked (slot_hyst_finish()).
- */
 static int
 hyst_group(Slot *s, int w, int h)
 {
@@ -904,12 +694,9 @@ hyst_group(Slot *s, int w, int h)
 	return IMG_OK;
 }
 
-/**
- * @brief Step 3a: starts hysteresis: all tiles active, and the first group
- *        of launches enqueued without waiting.
- *
- * The first launch processes every tile and is the most expensive, so the
- * host can do other work (the neighboring images' copies) meanwhile.
+/*
+ * The first launch processes every tile and is the most expensive, so it is
+ * started before the host copies the neighboring images.
  */
 static int
 slot_hyst_start(Slot *s)
@@ -938,12 +725,6 @@ slot_hyst_start(Slot *s)
 	return hyst_group(s, w, h);
 }
 
-/**
- * @brief Step 3b: completes hysteresis: waits for each group (only this
- *        slot's stream), and relaunches until a launch changes nothing,
- *        processing only the active tiles: all of them at first, then those
- *        whose neighbors changed their shared border.
- */
 static int
 slot_hyst_finish(Slot *s)
 {
@@ -971,10 +752,6 @@ slot_hyst_finish(Slot *s)
 	}
 }
 
-/**
- * @brief Step 4: converts the edge classes to the edge map and starts the
- *        download of the result into pinned memory.
- */
 static int
 slot_download(Slot *s)
 {
@@ -992,7 +769,6 @@ slot_download(Slot *s)
 
 		cudaEventRecord(s->ev[EV_DL0], s->stream);
 
-		/* classes to the edge map (255 / 0) */
 		if (s->edges) {
 			canny_finish_kernel<<<(unsigned)((n + 255) / 256), 256, 0, s->stream>>>(
 				(unsigned char *)s->e_map.p, n);
@@ -1010,13 +786,6 @@ slot_download(Slot *s)
 	return IMG_OK;
 }
 
-/**
- * @brief Step 5: waits for the slot's image, delivers its result, times and
- *        reports it, and frees the slot.
- *
- * The result goes to the image when edges were detected, to the job's
- * output when only denoised.
- */
 static void
 slot_finish(Slot *s, int status, GpuTiming *timing, void (*done)(GpuTask *, void *), void *ctx)
 {
@@ -1039,7 +808,6 @@ slot_finish(Slot *s, int status, GpuTiming *timing, void (*done)(GpuTask *, void
 		else if (s->denoise)
 			memcpy(t->job->out.data, s->h_out.p, (size_t)w * h);
 
-		/* each piece of work only, between its own pair of events (ms) */
 		if (s->denoise || s->edges) {
 			cudaEventElapsedTime(&up, s->ev[EV_UP0], s->ev[EV_UP1]);
 			cudaEventElapsedTime(&dl, s->ev[EV_DL0], s->ev[EV_DL1]);
@@ -1049,7 +817,7 @@ slot_finish(Slot *s, int status, GpuTiming *timing, void (*done)(GpuTask *, void
 		if (s->edges)
 			cudaEventElapsedTime(&px, s->ev[EV_PX0], s->ev[EV_PX1]);
 
-		/* each filter with its own share of the copies */
+		/* each filter with its share of the copies */
 		t->denoise_s = s->denoise ? (up + dn + (s->edges ? 0.0 : dl)) / 1000.0 : 0.0;
 		t->edges_s = s->edges ? ((s->denoise ? 0.0 : up) + px + s->hyst_ms + dl) / 1000.0 : 0.0;
 
@@ -1075,20 +843,6 @@ slot_finish(Slot *s, int status, GpuTiming *timing, void (*done)(GpuTask *, void
 		done(t, ctx);
 }
 
-/* ------------------------------------------------------------------------- */
-/*                            Public API Functions                           */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Initializes the first CUDA device.
- *
- * Makes the calling thread wait for the GPU by sleeping rather than spinning,
- * so that a thread waiting for the GPU leaves its core to the CPU stages.
- *
- * @param[out] info Device information (may be NULL).
- *
- * @return 0 on success, 1 if no usable GPU (already reported).
- */
 extern "C" int
 gpu_init(GpuInfo *info)
 {
@@ -1114,7 +868,7 @@ gpu_init(GpuInfo *info)
 		if (cuda_failed(cudaStreamCreateWithFlags(&slots[i].stream, cudaStreamNonBlocking),
 		                "cudaStreamCreate"))
 			return 1;
-		/* blocking-sync events: waiting for them sleeps instead of spinning */
+		/* waiting sleeps instead of spinning, leaving the core to the CPU stages */
 		for (int k = 0; k < EV_COUNT; k++)
 			if (cuda_failed(cudaEventCreateWithFlags(&slots[i].ev[k], cudaEventBlockingSync),
 			                "cudaEventCreate"))
@@ -1135,9 +889,6 @@ gpu_init(GpuInfo *info)
 	return 0;
 }
 
-/**
- * @brief Releases the GPU buffers. Safe to call when not initialized.
- */
 extern "C" void
 gpu_shutdown(void)
 {
@@ -1164,28 +915,6 @@ gpu_shutdown(void)
 	ready = 0;
 }
 
-/**
- * @brief Runs a batch of images through the GPU filters, overlapping the
- *        copies of neighboring images with the kernels.
- *
- * For every task: denoising if it has a prepared job (with noise to
- * remove), then edge detection if @p cs is given. Two images are in flight
- * at a time, in alternating slots: while image i's kernels run, image i+1
- * is uploaded and image i-1 downloaded. A task whose denoising the GPU does
- * not support gets IMG_ERR_UNSUPPORTED without any GPU work, for the caller
- * to process on the CPU.
- *
- * @note Not thread-safe: call from one thread (the pipeline's GPU thread).
- *
- * @param[in,out] tasks  Tasks; each one's status and times are set.
- * @param[in]     n      Number of tasks.
- * @param[in]     cs     Edge detection setup, or NULL for denoising only.
- * @param[in,out] timing GPU time of the steps, added to (may be NULL).
- * @param[in]     done   Called for each task when it completes (may be NULL).
- * @param[in]     ctx    Passed to @p done.
- *
- * @return Number of tasks that failed on the GPU (IMG_ERR_GPU).
- */
 extern "C" size_t
 gpu_run(GpuTask *tasks, size_t n, const CannySetup *cs, GpuTiming *timing,
         void (*done)(GpuTask *, void *), void *ctx)
@@ -1193,13 +922,12 @@ gpu_run(GpuTask *tasks, size_t n, const CannySetup *cs, GpuTiming *timing,
 	size_t failed = 0, k = 0, cur = 0;
 	int err = IMG_OK;
 
-	/* the Gaussian weights are the same for every image of the run */
+	/* the same Gaussian weights for every image */
 	if (cs && cuda_failed(cudaMemcpyToSymbol(c_weights, cs->weights,
 	                                         sizeof(int) * (2 * cs->radius + 1)),
 	                      "upload (Gaussian weights)"))
 		err = IMG_ERR_GPU;
 
-	/* tasks needing no GPU: unsupported denoising, or nothing to do */
 	for (size_t i = 0; i < n; i++) {
 		GpuTask *t = &tasks[i];
 		const int dn = (t->job && nlm_job_bands(t->job) > 0);
@@ -1216,7 +944,6 @@ gpu_run(GpuTask *tasks, size_t n, const CannySetup *cs, GpuTiming *timing,
 			done(t, ctx);
 	}
 
-	/* the next task needing the GPU, from index k */
 #define NEXT(k) do { while ((k) < n && tasks[(k)].status != GPU_PENDING) (k)++; } while (0)
 
 	NEXT(k);
@@ -1227,22 +954,18 @@ gpu_run(GpuTask *tasks, size_t n, const CannySetup *cs, GpuTiming *timing,
 		Slot *s = &slots[cur], *o = &slots[1 - cur];
 		size_t next = k + 1;
 
-		/*
-		 * 1. this image's kernels and its first (most expensive) hysteresis
-		 *    launch group, asynchronously
-		 */
+		/* this image's kernels and its first hysteresis group, asynchronously */
 		err = slot_kernels(s, cs);
 		if (err == IMG_OK)
 			err = slot_hyst_start(s);
 
-		/* 2. meanwhile, free the other slot (previous image) and stage the next image */
+		/* meanwhile, free the other slot and stage the next image there */
 		NEXT(next);
 		if (o->task)
 			slot_finish(o, IMG_OK, timing, done, ctx);
 		if (err == IMG_OK && next < n)
 			err = slot_stage(o, &tasks[next], cs != NULL);
 
-		/* 3.-4. the rest of this image's hysteresis, then its download, asynchronously */
 		if (err == IMG_OK)
 			err = slot_hyst_finish(s);
 		if (err == IMG_OK)
@@ -1256,7 +979,7 @@ gpu_run(GpuTask *tasks, size_t n, const CannySetup *cs, GpuTiming *timing,
 	}
 #undef NEXT
 
-	/* complete what is in flight; on an error, fail it and everything left */
+	/* on an error, fail what is in flight and everything left */
 	for (int i = 0; i < SLOTS; i++)
 		if (slots[(cur + i) % SLOTS].task)
 			slot_finish(&slots[(cur + i) % SLOTS], err == IMG_OK ? IMG_OK : IMG_ERR_GPU,

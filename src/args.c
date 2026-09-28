@@ -1,17 +1,8 @@
 /**
  * @file args.c
- * @brief Command-line argument parsing implementation.
- *
- * Provides functions to parse program arguments.
+ * @brief Command-line parsing.
  */
 
-/*
- * _GNU_SOURCE rather than _POSIX_C_SOURCE: with _POSIX_C_SOURCE alone glibc
- * maps getopt() to its strict POSIX variant, which stops at the first
- * operand, so "imgfilter data/ -o out/" would fail. The GNU variant permutes
- * arguments like the coreutils do; setting POSIXLY_CORRECT in the
- * environment restores strict POSIX behaviour.
- */
 #define _GNU_SOURCE
 
 #include <errno.h>
@@ -25,19 +16,9 @@
 #include "error.h"
 #include "image.h"
 
-/* Largest accepted NLM radii; beyond these the cost explodes for no gain (Gaussian sigma: 10) */
 #define MAX_PATCH_RADIUS  10
 #define MAX_SEARCH_RADIUS 50
 
-/* ------------------------------------------------------------------------- */
-/*                            Static Helper Functions                        */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Prints program usage instructions.
- *
- * Displays the valid command-line options and their expected arguments.
- */
 static void
 usage(void)
 {
@@ -96,16 +77,6 @@ usage(void)
 	free(program_name);
 }
 
-/**
- * @brief Parse an unsigned int from a decimal string with full validation.
- *
- * Accepts only a base-10 non-negative integer (no leading sign, no trailing
- * garbage). Detects overflow and reports failure.
- *
- * @param[in]  s   Input string.
- * @param[out] out Output value.
- * @return 1 on success, 0 on failure.
- */
 static int
 parse_uint(const char *s, unsigned int *out)
 {
@@ -129,15 +100,6 @@ parse_uint(const char *s, unsigned int *out)
 	return 1;
 }
 
-/**
- * @brief Parse a finite, non-negative double with full validation.
- *
- * Rejects signs, trailing garbage, overflow, NaN and infinity.
- *
- * @param[in]  s   Input string.
- * @param[out] out Output value.
- * @return 1 on success, 0 on failure.
- */
 static int
 parse_udouble(const char *s, double *out)
 {
@@ -157,9 +119,6 @@ parse_udouble(const char *s, double *out)
 	return 1;
 }
 
-/**
- * @brief Emit a consistent error for invalid/missing numeric argument.
- */
 static int
 bad_num(char opt)
 {
@@ -168,9 +127,6 @@ bad_num(char opt)
 	return 1;
 }
 
-/**
- * @brief Emit a consistent error for missing/unknown option.
- */
 static int
 bad_opt(int opt, int is_missing_arg)
 {
@@ -182,46 +138,6 @@ bad_opt(int opt, int is_missing_arg)
 	return 1;
 }
 
-/* ------------------------------------------------------------------------- */
-/*                            Public API Functions                           */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Parses command-line arguments.
- *
- * Validates all arguments and ensures the input path exists and is readable.
- * Provides helpful error messages and usage information on invalid input.
- *
- * Supported options:
- *   -o <output>   Output file or directory
- *   -f <format>   Output format: pgm or png
- *   -t <threads>  Number of threads (must be > 0)
- *   -B <images>   Images per batch (0: all at once)
- *   -b <file>     Write benchmark results as JSON ("-" for stdout)
- *   -n <trials>   Timed benchmark trials (must be > 0, requires -b)
- *   -w <wtrials>  Warmup benchmark trials (requires -b)
- *   -p            Show progress bars
- *   -d            Denoise with Non-Local Means
- *   -g            Run the filters on the GPU (CUDA), pipelined with the CPU stages
- *   -e            Detect edges (Canny); the output is the edge map
- *   -G <sigma>    Canny Gaussian standard deviation
- *   -l <low>      Canny low threshold
- *   -u <high>     Canny high threshold
- *   -P <radius>   NLM patch radius
- *   -S <radius>   NLM search radius
- *   -H <k>        NLM strength, h = k * sigma
- *   -N <sigma>    NLM noise standard deviation (default: estimated per image)
- *   -h            Show usage and exit
- *
- * Required argument:
- *   <input>       Image file or directory of images
- *
- * @param[in]     argc Argument count from main().
- * @param[in]     argv Argument vector from main().
- * @param[in,out] args Configuration, pre-filled with defaults.
- *
- * @return 0 on success, -1 if help requested, 1 on error.
- */
 int
 parse_args(int argc, char *argv[], Args *args)
 {
@@ -403,7 +319,6 @@ parse_args(int argc, char *argv[], Args *args)
 		}
 	}
 
-	/* Filter options without the filter are almost certainly a mistake */
 	if (nlm_opt && !args->denoise) {
 		uerrf("-P, -S, -H and -N require -d");
 		usage();
@@ -428,14 +343,12 @@ parse_args(int argc, char *argv[], Args *args)
 		return 1;
 	}
 
-	/* Repeating the work only makes sense when it is being measured */
 	if (repeat && !args->bench_path) {
 		uerrf("-n and -w require -b");
 		usage();
 		return 1;
 	}
 
-	/* Expect exactly one positional argument: the input path */
 	if (optind >= argc) {
 		uerrf("no input specified");
 		usage();

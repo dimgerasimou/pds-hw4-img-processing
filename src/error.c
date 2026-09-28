@@ -1,10 +1,6 @@
 /**
  * @file error.c
- * @brief Implementation of error handling utilities.
- *
- * Every printer locks stderr (flockfile) for the duration of one message,
- * so messages emitted concurrently from OpenMP threads never interleave
- * mid-line.
+ * @brief Error reporting.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -17,15 +13,6 @@
 
 static const char *g_prog = "imgfilter";
 
-/* ------------------------------------------------------------------------- */
-/*                              Static Helpers                               */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Extract basename from name and set as program name.
- *
- * @param[in] name Program path or name (typically argv[0]).
- */
 static void
 set_progname(const char *name)
 {
@@ -36,14 +23,6 @@ set_progname(const char *name)
 	g_prog = slash ? slash + 1 : name;
 }
 
-/**
- * @brief Format current local timestamp.
- *
- * Timestamp format: YYYY-MM-DD HH:MM:SS
- *
- * @param[out] buf Output buffer.
- * @param[in]  n   Size of output buffer.
- */
 static void
 timestamp_now(char *buf, size_t n)
 {
@@ -59,28 +38,12 @@ timestamp_now(char *buf, size_t n)
 		buf[0] = '\0';
 }
 
-/* ------------------------------------------------------------------------- */
-/*                              Public API                                   */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Initalize error reporting.
- *
- * @param[in] name Program name (typically argv[0]).
- */
 void
 err_init(const char *name)
 {
 	set_progname(name);
 }
 
-/**
- * @brief Get program name.
- *
- * @note Caller must free.
- *
- * @return Pointer to program name.
- */
 char*
 get_progname(void)
 {
@@ -92,22 +55,6 @@ get_progname(void)
 	return ret;
 }
 
-/* ------------------------------------------------------------------------- */
-/*                            User-facing errors                             */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Prints a user-facing error message to `stderr`.
- *
- * Message format:
- *   program_name: <formatted message>\n
- *
- * Use this for expected runtime/CLI errors (bad arguments, missing input,
- * invalid values, etc.).
- *
- * @param[in] fmt printf-style format string.
- * @param[in] ... Format arguments.
- */
 void
 uerrf(const char *fmt, ...)
 {
@@ -127,20 +74,6 @@ uerrf(const char *fmt, ...)
 	funlockfile(stderr);
 }
 
-/**
- * @brief Prints a user-facing error message to `stderr` with an errno string.
- *
- * Message format:
- *   program_name: <formatted message>: strerror(err)\n   (if err != 0)
- *   program_name: <formatted message>\n                  (if err == 0)
- *
- * Use this for expected failures that have a meaningful errno (file open,
- * read/write, permission errors, etc.).
- *
- * @param[in] err errno value to display (0 to omit strerror()).
- * @param[in] fmt printf-style format string.
- * @param[in] ... Format arguments.
- */
 void
 uerrnof(int err, const char *fmt, ...)
 {
@@ -163,28 +96,6 @@ uerrnof(int err, const char *fmt, ...)
 	funlockfile(stderr);
 }
 
-/* ------------------------------------------------------------------------- */
-/*                          Developer-facing errors                          */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Prints a developer-facing error message to `stderr`.
- *
- * Message format:
- *   [timestamp] program_name file:line function: <formatted message>\n
- *
- * If @p err is non-zero, appends:
- *   (errno=<err>: strerror(err))
- *
- * @note Use the macros provided so file:line:func are automatic.
- *
- * @param[in] file Source file the error happened.
- * @param[in] line Line number the error happened.
- * @param[in] func Function name the error happened.
- * @param[in] err  errno value to display (0 to omit strerror()).
- * @param[in] fmt  printf-style format string.
- * @param[in] ap   Format argument list.
- */
 void
 vderrf_at(const char *file, int line, const char *func,
           int err, const char *fmt, va_list ap)
@@ -208,20 +119,6 @@ vderrf_at(const char *file, int line, const char *func,
 	funlockfile(stderr);
 }
 
-/**
- * @brief Prints a developer-facing error message to `stderr` (printf-style).
- *
- * Same output as vderrf_at(), but takes variadic arguments.
- *
- * @note Use the macros provided so file:line:func are automatic.
- *
- * @param[in] file Source file the error happened.
- * @param[in] line Line number the error happened.
- * @param[in] func Function name the error happened.
- * @param[in] err  errno value to display (0 to omit strerror()).
- * @param[in] fmt  printf-style format string.
- * @param[in] ...  Format arguments.
- */
 void
 derrf_at(const char *file, int line, const char *func,
          int err, const char *fmt, ...)

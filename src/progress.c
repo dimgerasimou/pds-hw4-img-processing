@@ -1,12 +1,6 @@
 /**
  * @file progress.c
- * @brief Implementation of the thread-safe terminal progress bar.
- *
- * Concurrency model: the step counter is advanced with an OpenMP atomic
- * capture, so every thread knows exactly how many steps were completed
- * including its own. Drawing is serialized in a named critical section and
- * only happens when the integer percentage increases, which bounds a whole
- * run to at most ~100 redraws regardless of the number of steps.
+ * @brief Terminal progress bar.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -17,18 +11,9 @@
 
 #include "progress.h"
 
-/* Width of the bar itself, in characters */
 #define BAR_WIDTH 30
 
-/* ------------------------------------------------------------------------- */
-/*                            Static Helper Functions                        */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Renders the bar for @p done completed steps.
- *
- * Called with the "progress" critical section held (or single-threaded).
- */
+/* Called with the "progress" critical section held, or single-threaded. */
 static void
 draw(const Progress *p, size_t done)
 {
@@ -63,25 +48,12 @@ draw(const Progress *p, size_t done)
 	if (p->note[0])
 		fprintf(stderr, "  %s", p->note);
 
-	/* clear leftovers from a previously longer line */
+	/* clear leftovers of a longer previous line */
 	fputs("\033[K", stderr);
 	fflush(stderr);
 	funlockfile(stderr);
 }
 
-/* ------------------------------------------------------------------------- */
-/*                            Public API Functions                           */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Initializes a progress bar and draws it at 0%.
- *
- * @param[out] p       Progress bar to initialize.
- * @param[in]  label   Stage label (not copied, must outlive the bar).
- * @param[in]  total   Number of steps (0 is treated as already complete).
- * @param[in]  unit    Steps per displayed item (0 is treated as 1).
- * @param[in]  enabled Non-zero to draw, zero to make every call a no-op.
- */
 void
 progress_init(Progress *p, const char *label, size_t total, size_t unit,
               int enabled)
@@ -101,15 +73,6 @@ progress_init(Progress *p, const char *label, size_t total, size_t unit,
 	}
 }
 
-/**
- * @brief Changes the label and note, and redraws.
- *
- * Must be called from outside any parallel region.
- *
- * @param[in,out] p     Progress bar.
- * @param[in]     label New label (not copied), or NULL to keep the current one.
- * @param[in]     note  New note (copied, truncated), or NULL to keep the current one.
- */
 void
 progress_set(Progress *p, const char *label, const char *note)
 {
@@ -122,32 +85,18 @@ progress_set(Progress *p, const char *label, const char *note)
 		draw(p, p->done);
 }
 
-/**
- * @brief Erases the bar from the terminal line.
- *
- * Use before printing other messages to stderr; the next update redraws it.
- * Must be called from outside any parallel region.
- *
- * @param[in,out] p Progress bar.
- */
 void
 progress_clear(Progress *p)
 {
 	if (!p->enabled)
 		return;
 
+	flockfile(stderr);
 	fputs("\r\033[K", stderr);
 	fflush(stderr);
+	funlockfile(stderr);
 }
 
-/**
- * @brief Advances the progress bar by @p n steps.
- *
- * @note Thread-safe; may be called concurrently from OpenMP threads.
- *
- * @param[in,out] p Progress bar.
- * @param[in]     n Number of completed steps to add.
- */
 void
 progress_add(Progress *p, size_t n)
 {
@@ -179,26 +128,12 @@ progress_add(Progress *p, size_t n)
 	}
 }
 
-/**
- * @brief Advances the progress bar by one step.
- *
- * @note Thread-safe; may be called concurrently from OpenMP threads.
- *
- * @param[in,out] p Progress bar.
- */
 void
 progress_tick(Progress *p)
 {
 	progress_add(p, 1);
 }
 
-/**
- * @brief Draws the final state and terminates the line.
- *
- * Must be called from outside any parallel region.
- *
- * @param[in,out] p Progress bar.
- */
 void
 progress_finish(Progress *p)
 {

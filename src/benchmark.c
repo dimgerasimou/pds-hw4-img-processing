@@ -1,6 +1,6 @@
 /**
  * @file benchmark.c
- * @brief Implementation of the benchmarking framework.
+ * @brief Benchmark statistics and JSON output.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -19,16 +19,8 @@
 #include "error.h"
 #include "json.h"
 
-/* JSON output indentation level */
 #define JSON_INDENT 2
 
-/* ------------------------------------------------------------------------- */
-/*                            Static Helper Functions                        */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Comparison function for sorting doubles.
- */
 static int
 cmp_double(const void *a, const void *b)
 {
@@ -37,17 +29,6 @@ cmp_double(const void *a, const void *b)
 	return (da > db) - (da < db);
 }
 
-/**
- * @brief Calculates statistics over an array of times.
- *
- * The same summary is used for per-image times and for per-trial times.
- *
- * Sorts @p times in place.
- *
- * @param[in,out] times Array of times in seconds.
- * @param[in]     n     Number of times.
- * @param[out]    s     Statistics to populate.
- */
 static void
 calcstatistics(double *times, const size_t n, Statistics *s)
 {
@@ -79,9 +60,6 @@ calcstatistics(double *times, const size_t n, Statistics *s)
 		: 0.0;
 }
 
-/**
- * @brief Retrieves system memory information in GB.
- */
 static void
 getmeminfo(Benchmark *b)
 {
@@ -98,9 +76,6 @@ getmeminfo(Benchmark *b)
 #endif
 }
 
-/**
- * @brief Retrieves CPU model information from /proc/cpuinfo.
- */
 static void
 getcpuinfo(Benchmark *b)
 {
@@ -119,8 +94,8 @@ getcpuinfo(Benchmark *b)
 		if (strncmp(line, "model name", 10) == 0) {
 			char *p = strchr(line, ':');
 			if (p) {
-				snprintf(b->sys_info.cpu_info, sizeof(b->sys_info.cpu_info), "%s", p + 2); // skip ": "
-				b->sys_info.cpu_info[strcspn(b->sys_info.cpu_info, "\n")] = 0;             // remove newline
+				snprintf(b->sys_info.cpu_info, sizeof(b->sys_info.cpu_info), "%s", p + 2);
+				b->sys_info.cpu_info[strcspn(b->sys_info.cpu_info, "\n")] = 0;
 			}
 			break;
 		}
@@ -129,9 +104,6 @@ getcpuinfo(Benchmark *b)
 #endif
 }
 
-/**
- * @brief Generates an ISO-8601 formatted timestamp.
- */
 static void
 gettimestamp(Benchmark *b)
 {
@@ -142,24 +114,18 @@ gettimestamp(Benchmark *b)
 	         "%Y-%m-%dT%H:%M:%S", &tm);
 }
 
-/**
- * @brief Records the peak resident set size of the process.
- */
 static void
 getpeakrss(Benchmark *b)
 {
 	struct rusage ru;
 
-	/* ru_maxrss is reported in kilobytes on Linux */
+	/* ru_maxrss is reported in kiB */
 	if (getrusage(RUSAGE_SELF, &ru) == 0)
 		b->memory.cpu_peak_rss_gb = (double)ru.ru_maxrss / 1024.0 / 1024.0;
 	else
 		b->memory.cpu_peak_rss_gb = 0.0;
 }
 
-/**
- * @brief Reads the process-wide page fault counters (all threads).
- */
 static void
 getfaults(long *major, long *minor)
 {
@@ -173,9 +139,6 @@ getfaults(long *major, long *minor)
 	}
 }
 
-/**
- * @brief Records the dataset information from the image set.
- */
 static void
 getdatasetinfo(Benchmark *b, const ImageSet *set)
 {
@@ -206,9 +169,6 @@ getdatasetinfo(Benchmark *b, const ImageSet *set)
 	}
 }
 
-/**
- * @brief Records the noise levels used by the denoising stage.
- */
 static void
 getdenoiseinfo(Benchmark *b, const ImageSet *set)
 {
@@ -231,9 +191,6 @@ getdenoiseinfo(Benchmark *b, const ImageSet *set)
 	d->sigma_mean = n ? sum / n : 0.0;
 }
 
-/**
- * @brief Summarizes the recorded samples into the result structures.
- */
 static void
 summarize(Benchmark *b)
 {
@@ -260,27 +217,12 @@ summarize(Benchmark *b)
 		calcstatistics(b->gpu[k], n, &b->gpu_time[k]);
 }
 
-/**
- * @brief Copies a string into a fixed buffer, always NUL-terminating.
- */
 static void
 copy_str(char *dst, size_t n, const char *src)
 {
 	snprintf(dst, n, "%s", src ? src : "");
 }
 
-/* ------------------------------------------------------------------------- */
-/*                            Public API Implementation                      */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Returns current monotonic time in seconds.
- *
- * Uses CLOCK_MONOTONIC for reliable timing measurements that are not
- * affected by system clock adjustments.
- *
- * @return Current time in seconds (floating point).
- */
 double
 now_sec(void)
 {
@@ -289,25 +231,6 @@ now_sec(void)
 	return t.tv_sec + t.tv_nsec / 1e9;
 }
 
-/**
- * @brief Initializes a benchmark structure.
- *
- * Allocates a new Benchmark and its sample buffers, records the run
- * parameters and a timestamp, and captures system information.
- *
- * @param[in] input   Input path.
- * @param[in] output  Output path, or NULL if nothing is written.
- * @param[in] threads Number of OpenMP threads.
- * @param[in] trials  Number of timed trials (> 0).
- * @param[in] wtrials Number of warmup trials.
- * @param[in] batch   Images per batch.
- * @param[in] batches Number of batches per trial.
- * @param[in] images  Number of images in the set.
- * @param[in] denoise Denoising stage configuration.
- * @param[in] edges   Edge detection stage configuration.
- *
- * @return Pointer to a newly allocated Benchmark structure, or NULL on failure.
- */
 Benchmark*
 benchmark_init(const char *input, const char *output, const unsigned int threads,
                const unsigned int trials, const unsigned int wtrials,
@@ -370,12 +293,6 @@ fail:
 	return NULL;
 }
 
-/**
- * @brief Records the GPU used for the run.
- *
- * @param[in,out] b    Benchmark structure.
- * @param[in]     info GPU information.
- */
 void
 benchmark_set_gpu(Benchmark *b, const GpuInfo *info)
 {
@@ -384,14 +301,9 @@ benchmark_set_gpu(Benchmark *b, const GpuInfo *info)
 
 	b->sys_info.has_gpu = 1;
 	b->sys_info.gpu = *info;
-	b->denoise_info.gpu = 1;   /* the filters run on the GPU */
+	b->denoise_info.gpu = 1;
 }
 
-/**
- * @brief Frees a Benchmark structure. Safe to call with NULL.
- *
- * @param[in,out] b Pointer to the Benchmark structure to free.
- */
 void
 benchmark_free(Benchmark *b)
 {
@@ -408,13 +320,6 @@ benchmark_free(Benchmark *b)
 	free(b);
 }
 
-/**
- * @brief Marks the start of a timed trial.
- *
- * Records the start time and the page fault counters.
- *
- * @param[in,out] b Benchmark structure.
- */
 void
 benchmark_trial_start(Benchmark *b)
 {
@@ -422,18 +327,6 @@ benchmark_trial_start(Benchmark *b)
 	b->trial_start = now_sec();
 }
 
-/**
- * @brief Records a finished timed trial.
- *
- * Stores the stage wall times and per-image times from the image set, the
- * whole-pipeline time since benchmark_trial_start(), and the page faults.
- * The first call also fills the dataset information.
- *
- * @param[in,out] b   Benchmark structure.
- * @param[in]     set Image set after the trial.
- *
- * @return 0 on success, 1 on error.
- */
 int
 benchmark_trial_end(Benchmark *b, const ImageSet *set)
 {
@@ -507,18 +400,6 @@ benchmark_trial_end(Benchmark *b, const ImageSet *set)
 	return 0;
 }
 
-/**
- * @brief Writes benchmark results as JSON.
- *
- * Summarizes the recorded trials, captures the peak memory usage, and
- * writes system information, benchmark parameters, dataset information,
- * stage results, pipeline time and memory usage.
- *
- * @param[in,out] b    Benchmark structure with recorded trials.
- * @param[in]     path Output file path, or "-" for stdout.
- *
- * @return 0 on success, 1 on error (already reported).
- */
 int
 benchmark_write(Benchmark *b, const char *path)
 {
@@ -565,12 +446,6 @@ benchmark_write(Benchmark *b, const char *path)
 	print_statistics(f, "pipeline_time", &b->pipeline_time, JSON_INDENT);
 	fprintf(f, ",\n");
 
-	/*
-	 * GPU time per step, over trials, measured by the GPU (CUDA events);
-	 * hysteresis is part of edges_kernels. Launches and tiles (processed,
-	 * and what all launches would process if every tile were active):
-	 * medians over trials.
-	 */
 	fprintf(f, "%*s\"gpu_time\": ", JSON_INDENT, "");
 	if (!b->denoise_info.gpu) {
 		fputs("null,\n", f);

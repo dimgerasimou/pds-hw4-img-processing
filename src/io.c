@@ -1,6 +1,6 @@
 /**
  * @file io.c
- * @brief Implementation of path resolution and parallel image loading/saving.
+ * @brief Path resolution and the processing stages.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -21,63 +21,35 @@
 #include "nlm.h"
 #include "progress.h"
 
-/**
- * @enum Output modes
- * @brief Where processed images are written.
- */
 enum {
-	OUT_NONE = 0, /**< Nothing is written */
-	OUT_FILE,     /**< Single output file */
-	OUT_DIR       /**< Output directory */
+	OUT_NONE = 0,
+	OUT_FILE,
+	OUT_DIR
 };
 
-/* Stage names, indexed by STAGE_* */
 static const char *stage_names[STAGE_COUNT] = {
 	"read", "decode", "denoise", "edges", "encode", "write"
 };
 
 /*
- * Band height for the denoise stage. With at least one image per thread,
- * about BAND_PER_THREAD bands per thread over the batch, within
- * [BAND_MIN_ROWS, BAND_MAX_ROWS]: smaller bands balance the load better,
- * but every band recomputes 2 * patch radius extra rows of integral image,
- * so they should not get too small. With fewer images than threads, every
- * image gets a multiple of the thread count of bands of at most
- * BAND_MAX_ROWS rows, so that each image divides evenly over the threads.
+ * Denoise band height: about BAND_PER_THREAD bands per thread over the
+ * batch. With fewer images than threads, each image gets a multiple of the
+ * thread count of bands instead (see band_rows()).
  */
 #define BAND_PER_THREAD 4
 #define BAND_MIN_ROWS   16
 #define BAND_MAX_ROWS   32
 
-/**
- * @struct BandOrder
- * @brief Image index with its sort key, for ordering the denoise work.
- */
 typedef struct {
-	size_t k;           /**< Index within the batch */
-	unsigned int width; /**< Image width: bands of wider images cost more */
+	size_t k;
+	unsigned int width; /* bands of wider images cost more */
 } BandOrder;
 
-/**
- * @struct OutName
- * @brief Output path paired with its input, for collision detection.
- */
 typedef struct {
-	const char *out; /**< Output path */
-	const char *in;  /**< Input path it comes from */
+	const char *out;
+	const char *in;
 } OutName;
 
-/* ------------------------------------------------------------------------- */
-/*                            Static Helper Functions                        */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Joins a directory and a file name with exactly one '/'.
- *
- * @note Caller must free.
- *
- * @return Newly allocated path, or NULL on allocation failure.
- */
 static char*
 path_join(const char *dir, const char *name)
 {
@@ -98,9 +70,6 @@ path_join(const char *dir, const char *name)
 	return p;
 }
 
-/**
- * @brief Returns the last component of a file path.
- */
 static const char*
 base_name(const char *path)
 {
@@ -108,9 +77,6 @@ base_name(const char *path)
 	return slash ? slash + 1 : path;
 }
 
-/**
- * @brief Checks whether a path ends in '/', i.e. explicitly names a directory.
- */
 static int
 has_trailing_slash(const char *path)
 {
@@ -118,25 +84,13 @@ has_trailing_slash(const char *path)
 	return n > 0 && path[n - 1] == '/';
 }
 
-/**
- * @brief Checks whether a file name has a supported image extension.
- */
 static int
 is_image_name(const char *name)
 {
 	return image_format_from_ext(name) != IMG_FMT_UNKNOWN;
 }
 
-/**
- * @brief Returns a copy of a file name with its extension replaced.
- *
- * "scan.01.png" + ".pgm" -> "scan.01.pgm"; a name without extension gets
- * @p ext appended.
- *
- * @note Caller must free.
- *
- * @return Newly allocated name, or NULL on allocation failure.
- */
+/* "scan.01.png" -> "scan.01.pgm"; a leading dot does not start an extension. */
 static char*
 replace_ext(const char *name, const char *ext)
 {
@@ -155,20 +109,12 @@ replace_ext(const char *name, const char *ext)
 	return r;
 }
 
-/**
- * @brief Comparison function for sorting OutName by output path.
- */
 static int
 cmp_outname(const void *a, const void *b)
 {
 	return strcmp(((const OutName *)a)->out, ((const OutName *)b)->out);
 }
 
-/**
- * @brief Refuses a set in which two inputs map to the same output path.
- *
- * @return 0 if all output paths are distinct, 1 otherwise (reported).
- */
 static int
 check_collisions(const ImageSet *set)
 {
@@ -203,27 +149,18 @@ check_collisions(const ImageSet *set)
 	return bad;
 }
 
-/**
- * @brief Checks whether two stat results refer to the same file.
- */
 static int
 same_file(const struct stat *a, const struct stat *b)
 {
 	return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
 }
 
-/**
- * @brief Comparison function for sorting strings.
- */
 static int
 cmp_str(const void *a, const void *b)
 {
 	return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-/**
- * @brief Frees an array of strings.
- */
 static void
 free_names(char **names, size_t n)
 {
@@ -235,18 +172,7 @@ free_names(char **names, size_t n)
 	free(names);
 }
 
-/**
- * @brief Lists the image files of a directory, sorted by name.
- *
- * Non-recursive. Hidden files and anything that is not a regular file
- * (after following symlinks) are ignored.
- *
- * @param[in]  dir   Directory to scan.
- * @param[out] names Newly allocated array of file names (caller frees).
- * @param[out] count Number of names.
- *
- * @return 0 on success, 1 on error (already reported).
- */
+/* Regular files with an image extension, sorted, hidden files skipped. */
 static int
 list_dir(const char *dir, char ***names, size_t *count)
 {
@@ -322,22 +248,7 @@ fail:
 	return 1;
 }
 
-/**
- * @brief Decides the output mode.
- *
- * Nothing is created here: when the output directory does not exist yet,
- * @p create is set and the caller creates it once every other check has
- * passed, so a refused run leaves no empty directory behind. Refuses to
- * overwrite the input.
- *
- * @param[in]  input  Input path.
- * @param[in]  in_st  stat() of the input.
- * @param[in]  output Output path, or NULL.
- * @param[out] mode   OUT_NONE, OUT_FILE or OUT_DIR.
- * @param[out] create 1 if the output directory must be created.
- *
- * @return 0 on success, 1 on error (already reported).
- */
+/* Creates nothing: the caller creates a missing directory once all checks pass. */
 static int
 resolve_output(const char *input, const struct stat *in_st,
                const char *output, int *mode, int *create)
@@ -390,12 +301,6 @@ resolve_output(const char *input, const struct stat *in_st,
 	return 0;
 }
 
-/**
- * @brief Picks the output format.
- *
- * Explicit request first; then, for a single output file, the extension of
- * that file if it names a writable format; PGM otherwise.
- */
 static int
 choose_format(int requested, int mode, const char *output)
 {
@@ -411,16 +316,6 @@ choose_format(int requested, int mode, const char *output)
 	return IMG_FMT_PGM;
 }
 
-/**
- * @brief Reads a whole file into a newly allocated buffer.
- *
- * @param[in]  path Path to read.
- * @param[out] buf  Newly allocated contents (caller frees).
- * @param[out] len  Size in bytes.
- * @param[out] err  errno on failure.
- *
- * @return IMG_OK, IMG_ERR_SYS, IMG_ERR_NOMEM or IMG_ERR_TRUNC.
- */
 static int
 file_read(const char *path, unsigned char **buf, size_t *len, int *err)
 {
@@ -466,7 +361,6 @@ file_read(const char *path, unsigned char **buf, size_t *len, int *err)
 		if (r < 0 && errno == EINTR)
 			continue;
 
-		/* r == 0: file shrank while reading */
 		*err = (r < 0) ? errno : 0;
 		free(p);
 		close(fd);
@@ -479,16 +373,6 @@ file_read(const char *path, unsigned char **buf, size_t *len, int *err)
 	return IMG_OK;
 }
 
-/**
- * @brief Writes a buffer to a file, creating or truncating it.
- *
- * @param[in]  path Path to write.
- * @param[in]  buf  Data.
- * @param[in]  len  Size in bytes.
- * @param[out] err  errno on failure.
- *
- * @return IMG_OK or IMG_ERR_SYS.
- */
 static int
 file_write(const char *path, const unsigned char *buf, size_t len, int *err)
 {
@@ -511,12 +395,11 @@ file_write(const char *path, const unsigned char *buf, size_t len, int *err)
 		if (w < 0 && errno == EINTR)
 			continue;
 
-		*err = errno;
+		*err = (w < 0) ? errno : EIO;
 		close(fd);
 		return IMG_ERR_SYS;
 	}
 
-	/* delayed write errors (e.g. on NFS) surface at close() */
 	if (close(fd) != 0) {
 		*err = errno;
 		return IMG_ERR_SYS;
@@ -525,9 +408,6 @@ file_write(const char *path, const unsigned char *buf, size_t len, int *err)
 	return IMG_OK;
 }
 
-/**
- * @brief Read stage for one image: file -> buf.
- */
 static int
 do_read(ImageItem *it)
 {
@@ -536,9 +416,6 @@ do_read(ImageItem *it)
 	return r;
 }
 
-/**
- * @brief Decode stage for one image: buf -> img. Releases buf.
- */
 static int
 do_decode(ImageItem *it)
 {
@@ -554,11 +431,6 @@ do_decode(ImageItem *it)
 	return r;
 }
 
-/**
- * @brief Encode stage for one image: img -> buf. Releases img.
- *
- * Encoding is the last use of the pixels, so they are freed right away.
- */
 static int
 do_encode(ImageItem *it, int fmt)
 {
@@ -570,9 +442,6 @@ do_encode(ImageItem *it, int fmt)
 	return r;
 }
 
-/**
- * @brief Write stage for one image: buf -> file. Releases buf.
- */
 static int
 do_write(ImageItem *it)
 {
@@ -586,24 +455,13 @@ do_write(ImageItem *it)
 	return r;
 }
 
-/**
- * @brief Progress units of one image in a stage.
- *
- * Denoising costs about as many units as its search window has offsets;
- * every other stage counts 1. See io_progress_units().
- */
 static size_t
 io_stage_units(const ImageSet *set, int stage)
 {
 	return (stage == STAGE_DENOISE) ? nlm_units(&set->denoise.params) : 1;
 }
 
-/**
- * @brief Adds @p wall seconds to a stage's total and marks it performed.
- *
- * Atomic: with the GPU pipeline, the CPU and GPU threads can finish parts
- * of the same stage (preparation and GPU run of denoising) concurrently.
- */
+/* Atomic: in the GPU pipeline, two threads can finish parts of one stage. */
 static void
 stage_done(ImageSet *set, int stage, double wall)
 {
@@ -614,19 +472,9 @@ stage_done(ImageSet *set, int stage, double wall)
 	set->performed[stage] = 1;
 }
 
-/**
- * @brief Marks a stage as not attempted for an image.
- *
- * @param[in,out] it    Image.
- * @param[in]     stage STAGE_* value.
- * @param[in]     units Progress units of the stage for other stages.
- *
- * @return Progress units the skipped image still accounts for.
- */
 static size_t
 skip(ImageItem *it, int stage, size_t units)
 {
-	/* also tells the compiler the range, which the OpenMP-outlined caller loses */
 	if (stage < 0 || stage >= STAGE_COUNT)
 		return units;
 
@@ -634,12 +482,6 @@ skip(ImageItem *it, int stage, size_t units)
 	return (stage == STAGE_DENOISE) ? it->units : units;
 }
 
-/**
- * @brief Checks whether an image holds valid pixels after the pixel stages.
- *
- * Denoising and edge detection are optional: the pixels come from the last
- * of decode, denoise and edges that is enabled.
- */
 static int
 pixels_ok(const ImageSet *set, const ImageItem *it)
 {
@@ -650,10 +492,6 @@ pixels_ok(const ImageSet *set, const ImageItem *it)
 	return it->err[STAGE_DECODE] == IMG_OK;
 }
 
-/**
- * @brief Checks whether an image holds valid pixels for edge detection:
- *        denoised if denoising is enabled, decoded otherwise.
- */
 static int
 edges_input_ok(const ImageSet *set, const ImageItem *it)
 {
@@ -662,9 +500,6 @@ edges_input_ok(const ImageSet *set, const ImageItem *it)
 	return it->err[STAGE_DECODE] == IMG_OK;
 }
 
-/**
- * @brief Checks whether an image should take part in a stage.
- */
 static int
 eligible(const ImageSet *set, const ImageItem *it, int stage)
 {
@@ -679,16 +514,10 @@ eligible(const ImageSet *set, const ImageItem *it, int stage)
 	}
 }
 
-/**
- * @brief Distributes the denoise progress units of a batch over its images.
- *
- * The batch owns (images x nlm_units()) units, a constant, so the bar's
- * total never changes. Within the batch they are shared in proportion to
- * the images' pixel counts, since denoising time is proportional to them:
- * without this, bands of a large image would advance the bar as much as
- * those of a small one. Images that will not be denoised keep one image's
- * worth, which they add at once. Shares are rounded cumulatively so that
- * they add up exactly.
+/*
+ * A batch owns images x nlm_units() denoise units, shared by pixel count so
+ * that bands of large and small images advance the bar alike. Rounded
+ * cumulatively so the shares add up exactly.
  */
 static void
 assign_units(ImageSet *set, size_t first, size_t last)
@@ -722,9 +551,6 @@ assign_units(ImageSet *set, size_t first, size_t last)
 	}
 }
 
-/**
- * @brief Comparison function: wider images first.
- */
 static int
 cmp_band_order(const void *a, const void *b)
 {
@@ -735,15 +561,11 @@ cmp_band_order(const void *a, const void *b)
 	return (x->k > y->k) - (x->k < y->k);
 }
 
-/**
- * @brief Finds the job owning global band @p g: start[k] <= g < start[k+1].
- */
 static size_t
 find_job(const long *start, size_t n, long g)
 {
 	size_t lo = 0, hi = n;
 
-	/* last k with start[k] <= g */
 	while (hi - lo > 1) {
 		size_t mid = lo + (hi - lo) / 2;
 		if (start[mid] <= g)
@@ -755,14 +577,6 @@ find_job(const long *start, size_t n, long g)
 	return lo;
 }
 
-/**
- * @brief Band height for an image of @p h rows (see BAND_* above).
- *
- * @param[in] h       Image height.
- * @param[in] band    Band height used with at least one image per thread.
- * @param[in] few     Non-zero when the batch has fewer images than threads.
- * @param[in] threads Number of threads.
- */
 static long
 band_rows(long h, long band, int few, long threads)
 {
@@ -777,22 +591,10 @@ band_rows(long h, long band, int few, long threads)
 	return band > 0 ? band : 1;
 }
 
-/**
- * @brief Denoise stage over the images [first, last).
- *
- * 1. Prepare every image (noise estimate, padding, weight table): with at
- *    least one image per thread, one image per thread; otherwise one image
- *    at a time, each using all threads.
- * 2. Run every band of every image as one pool of work, handed out to the
- *    threads dynamically: a large image is spread over all threads and the
- *    idle time at the end is at most about one band. Bands of wider (more
- *    expensive) images are handed out first, so the last ones are cheap.
- * 3. Collect the outputs.
- *
- * An image's recorded time is the thread time spent on it (preparation plus
- * its bands).
- *
- * @return Number of images that failed.
+/*
+ * Bands of all images form one pool that the threads draw from, wider
+ * images first, so a large image spreads over all threads and the idle time
+ * at the end is about one band.
  */
 static size_t
 denoise_bands(ImageSet *set, size_t first, size_t last, Progress *progress)
@@ -835,10 +637,7 @@ denoise_bands(ImageSet *set, size_t first, size_t last, Progress *progress)
 	band = rows / (BAND_PER_THREAD * threads);
 	band = band < BAND_MIN_ROWS ? BAND_MIN_ROWS : band > BAND_MAX_ROWS ? BAND_MAX_ROWS : band;
 
-	/*
-	 * 1. prepare: with few images, each one with all threads (noise estimate,
-	 *    padding and table are parallel inside); otherwise one per thread
-	 */
+	/* with few images, prepare one at a time, each with all threads */
 	#pragma omp parallel for schedule(dynamic) reduction(+:failed) if(!few)
 	for (size_t k = 0; k < n; k++) {
 		ImageItem *it = &set->items[first + k];
@@ -884,7 +683,6 @@ denoise_bands(ImageSet *set, size_t first, size_t last, Progress *progress)
 	}
 	total = start[m];
 
-	/* 2. all bands of all images */
 	#pragma omp parallel
 	{
 		NlmScratch *s = NULL;
@@ -923,17 +721,16 @@ denoise_bands(ImageSet *set, size_t first, size_t last, Progress *progress)
 		nlm_scratch_free(s);
 	}
 
-	/* 3. collect */
 	for (size_t j = 0; j < m; j++) {
 		size_t k = order[j].k;
 		ImageItem *it = &set->items[first + k];
 		Image out;
 
-		/* done at preparation (nothing to run) */
+		/* nothing to run: done at preparation */
 		if (nlm_job_bands(&jobs[k]) == 0)
 			progress_add(progress, it->units);
 
-		/* bands never run (no memory): account for them so the bar completes */
+		/* bands that never ran (no memory): still advance the bar */
 		if (nomem && left[j] > 0)
 			for (long b = nlm_job_bands(&jobs[k]) - left[j]; b < nlm_job_bands(&jobs[k]); b++)
 				progress_add(progress, nlm_band_units(it->units, b, nlm_job_bands(&jobs[k])));
@@ -957,9 +754,6 @@ denoise_bands(ImageSet *set, size_t first, size_t last, Progress *progress)
 	return failed;
 }
 
-/**
- * @brief Reports the failures of a stage within a range, in input order.
- */
 static void
 report_failures(const ImageSet *set, int stage, size_t first, size_t last)
 {
@@ -1003,29 +797,6 @@ report_failures(const ImageSet *set, int stage, size_t first, size_t last)
 	}
 }
 
-/* ------------------------------------------------------------------------- */
-/*                            Public API Functions                           */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Builds the image set from the input and output arguments.
- *
- * Resolves the input (file or directory), lists the images, decides the
- * output format and where each image is written, checks for name
- * collisions, and creates the output directory if needed. No image data is
- * read.
- *
- * The output format is @p format if given; otherwise, for a single output
- * file with a writable extension (.pgm/.png), the format of that extension;
- * otherwise PGM.
- *
- * @param[in]  input  Input file or directory.
- * @param[in]  output Output file or directory, or NULL to not write.
- * @param[in]  format Requested output format, or IMG_FMT_UNKNOWN for automatic.
- * @param[out] set    Image set to fill (zeroed on failure).
- *
- * @return 0 on success, 1 on error (already reported).
- */
 int
 io_resolve(const char *input, const char *output, int format, ImageSet *set)
 {
@@ -1053,7 +824,7 @@ io_resolve(const char *input, const char *output, int format, ImageSet *set)
 	set->out_format = (mode == OUT_NONE) ? IMG_FMT_UNKNOWN
 	                                     : choose_format(format, mode, output);
 
-	/* an explicit -f that contradicts the -o file name is almost always a typo */
+	/* an -f contradicting the -o extension is almost always a typo */
 	if (mode == OUT_FILE && format != IMG_FMT_UNKNOWN) {
 		int ext = image_format_from_ext(output);
 		if (ext != IMG_FMT_UNKNOWN && ext != set->out_format)
@@ -1109,7 +880,7 @@ io_resolve(const char *input, const char *output, int format, ImageSet *set)
 	if (mode == OUT_DIR && check_collisions(set))
 		goto fail_quiet;
 
-	/* file -> dir: the destination may still turn out to be the input itself */
+	/* file -> dir: the destination may be the input itself */
 	if (!in_dir && mode == OUT_DIR && !create) {
 		struct stat dst;
 		if (stat(set->items[0].out_path, &dst) == 0 && same_file(&in_st, &dst)) {
@@ -1119,7 +890,6 @@ io_resolve(const char *input, const char *output, int format, ImageSet *set)
 		}
 	}
 
-	/* every check passed: only now create the output directory */
 	if (create && mkdir(output, 0755) != 0) {
 		uerrnof(errno, "cannot create directory \"%s\"", output);
 		goto fail_quiet;
@@ -1136,31 +906,15 @@ fail_quiet:
 	return 1;
 }
 
-/*
- * Band height for edge detection: about EDGE_BANDS_PER_THREAD bands per
- * thread over the batch, within [EDGE_MIN_ROWS, EDGE_MAX_ROWS]. Every band
- * recomputes 4 + 2 * (Gaussian radius) border rows of blur, so bands should
- * not be too small.
- */
+/* Edge band height; each band recomputes 4 + 2 * radius rows of blur. */
 #define EDGE_BANDS_PER_THREAD 4
 #define EDGE_MIN_ROWS         16
-#define EDGE_MAX_ROWS         64
+#define EDGE_MAX_ROWS         128
 
-/**
- * @brief Edge detection stage over the images [first, last).
- *
- * Like denoising: the bands of all images of the batch form one pool,
- * handed out to the threads dynamically, bands of wider images first. Each
- * band is classified with the thread's own small buffers (canny_band()).
- * The thread that completes the last band of an image runs its hysteresis
- * right away, so hysteresis overlaps with the other images' bands instead
- * of forming a separate phase. The class map is a separate buffer, since
- * other bands still read the image; it replaces the image once complete.
- *
- * An image's recorded time is the thread time spent on it (its bands plus
- * its hysteresis).
- *
- * @return Number of images that failed.
+/*
+ * As for denoising, all bands of the batch form one pool. The thread that
+ * finishes an image's last band runs its hysteresis right away. The class
+ * map is a separate buffer, since other bands still read the image.
  */
 static size_t
 edges_bands(ImageSet *set, size_t first, size_t last, Progress *progress)
@@ -1189,7 +943,6 @@ edges_bands(ImageSet *set, size_t first, size_t last, Progress *progress)
 		return failed;
 	}
 
-	/* eligible images, their class maps, and the band height */
 	for (size_t k = 0; k < n; k++) {
 		ImageItem *it = &set->items[first + k];
 
@@ -1221,7 +974,6 @@ edges_bands(ImageSet *set, size_t first, size_t last, Progress *progress)
 	band = rows / (EDGE_BANDS_PER_THREAD * threads);
 	band = band < EDGE_MIN_ROWS ? EDGE_MIN_ROWS : band > EDGE_MAX_ROWS ? EDGE_MAX_ROWS : band;
 
-	/* global band numbering, wider images first */
 	qsort(order, m, sizeof(BandOrder), cmp_band_order);
 
 	start[0] = 0;
@@ -1259,7 +1011,6 @@ edges_bands(ImageSet *set, size_t first, size_t last, Progress *progress)
 			#pragma omp atomic capture
 			rem = --left[j];
 
-			/* last band of the image: hysteresis, then the image becomes the edge map */
 			if (rem == 0) {
 				int r = canny_hysteresis(maps[k], (int)it->img.width, (int)it->img.height);
 
@@ -1302,32 +1053,6 @@ edges_bands(ImageSet *set, size_t first, size_t last, Progress *progress)
 	return failed;
 }
 
-/**
- * @brief Runs one stage over the eligible images of a range, in parallel.
- *
- * An image is eligible if it passed the previous stage (and, for encode and
- * write, has an output path). Failures are reported after the parallel
- * region, in input order, unless set->quiet is set. The wall time of the
- * call is added to the stage's total in the set.
- *
- * Every image of the range advances @p progress by its units for the
- * stage, eligible or not, so a bar sized with io_progress_units() always
- * reaches 100%. The denoise stage advances it band by band.
- *
- * Data volume recorded per image: bytes read (read), pixel bytes produced
- * (decode), pixel bytes consumed (encode), bytes written (write).
- *
- * Buffers are released as soon as they are no longer needed: file contents
- * after decode, pixels after encode, encoded data after write.
- *
- * @param[in,out] set      Image set.
- * @param[in]     stage    STAGE_* value.
- * @param[in]     first    First image of the range.
- * @param[in]     last     One past the last image of the range.
- * @param[in,out] progress Progress bar to advance (may be disabled).
- *
- * @return Number of images that failed this stage.
- */
 size_t
 io_run(ImageSet *set, int stage, size_t first, size_t last, Progress *progress)
 {
@@ -1387,7 +1112,7 @@ io_run(ImageSet *set, int stage, size_t first, size_t last, Progress *progress)
 done:
 	stage_done(set, stage, omp_get_wtime() - t0);
 
-	/* move the bar out of the way so the messages get their own lines */
+	/* move the bar out of the way of the messages */
 	if (failed && !set->quiet) {
 		progress_clear(progress);
 		report_failures(set, stage, first, last);
@@ -1396,21 +1121,6 @@ done:
 	return failed;
 }
 
-/**
- * @brief GPU denoising, CPU part: prepares the images of a range.
- *
- * Computes, for every image, the noise estimate, the mirrored padding and
- * the weight table (nlm_job_prepare()), in parallel over the images (or,
- * with fewer images than threads, one image at a time with all threads).
- * The prepared jobs are kept in the items for io_gpu_filter().
- *
- * @param[in,out] set      Image set (denoising must be enabled).
- * @param[in]     first    First image of the range.
- * @param[in]     last     One past the last image of the range.
- * @param[in,out] progress Progress bar (advanced for images that are skipped).
- *
- * @return Number of images that failed.
- */
 size_t
 io_prepare(ImageSet *set, size_t first, size_t last, Progress *progress)
 {
@@ -1439,7 +1149,7 @@ io_prepare(ImageSet *set, size_t first, size_t last, Progress *progress)
 			continue;
 		}
 
-		/* the GPU processes the whole image at once: one band */
+		/* the GPU processes the whole image at once */
 		it->bytes[STAGE_DENOISE] = image_bytes(&it->img);
 		ts = omp_get_wtime();
 		it->err[STAGE_DENOISE] = nlm_job_prepare(&it->img, p, (long)it->img.height, few,
@@ -1456,11 +1166,6 @@ io_prepare(ImageSet *set, size_t first, size_t last, Progress *progress)
 	return failed;
 }
 
-/**
- * @brief Denoises a prepared job on the CPU, one band after the other.
- *
- * Fallback for jobs the GPU does not support.
- */
 static int
 cpu_fallback(NlmJob *job, unsigned int width, unsigned int patch)
 {
@@ -1476,9 +1181,6 @@ cpu_fallback(NlmJob *job, unsigned int width, unsigned int patch)
 	return IMG_OK;
 }
 
-/**
- * @brief Edge detection of one image on the CPU (fallback of the GPU path).
- */
 static int
 cpu_edges(Image *img, const CannySetup *cs)
 {
@@ -1506,19 +1208,11 @@ cpu_edges(Image *img, const CannySetup *cs)
 	return IMG_OK;
 }
 
-/**
- * @struct GpuCtx
- * @brief Context of gpu_run()'s completion callback.
- */
 typedef struct {
-	ImageSet *set;      /**< Image set */
-	Progress *progress; /**< Progress bar */
+	ImageSet *set;
+	Progress *progress;
 } GpuCtx;
 
-/**
- * @brief gpu_run() completion callback: advances the progress bar by the
- *        units of the filters the image went through.
- */
 static void
 gpu_task_done(GpuTask *t, void *ctx)
 {
@@ -1534,25 +1228,6 @@ gpu_task_done(GpuTask *t, void *ctx)
 	progress_add(g->progress, units);
 }
 
-/**
- * @brief GPU filters: denoises and/or detects the edges of a range.
- *
- * Hands all images of the range to gpu_run(), which overlaps the copies of
- * neighboring images with the kernels, then collects the results. An image
- * whose denoising parameters exceed the GPU's limits is processed on the
- * CPU instead, with the same result. Meant to run on its own thread while
- * the CPU stages work on other batches.
- *
- * The per-image and stage times of the GPU filters are GPU times (CUDA
- * events), including each filter's copies.
- *
- * @param[in,out] set      Image set.
- * @param[in]     first    First image of the range.
- * @param[in]     last     One past the last image of the range.
- * @param[in,out] progress Progress bar (advanced per image).
- *
- * @return Number of stage failures.
- */
 size_t
 io_gpu_filter(ImageSet *set, size_t first, size_t last, Progress *progress)
 {
@@ -1571,7 +1246,6 @@ io_gpu_filter(ImageSet *set, size_t first, size_t last, Progress *progress)
 		return last - first;
 	}
 
-	/* one task per image that goes to the GPU */
 	for (size_t i = first; i < last; i++) {
 		ImageItem *it = &set->items[i];
 
@@ -1600,14 +1274,13 @@ io_gpu_filter(ImageSet *set, size_t first, size_t last, Progress *progress)
 
 	gpu_run(tasks, n, ed ? &set->edges.setup : NULL, &set->gpu_time, gpu_task_done, &ctx);
 
-	/* collect the results */
 	for (size_t k = 0; k < n; k++) {
 		GpuTask *t = &tasks[k];
 		ImageItem *it = t->user;
 		Image out;
 		int r = t->status;
 
-		/* denoising the GPU does not support: both filters on the CPU */
+		/* denoising the GPU cannot do: both filters on the CPU */
 		if (r == IMG_ERR_UNSUPPORTED) {
 			double ts = omp_get_wtime();
 
@@ -1628,7 +1301,7 @@ io_gpu_filter(ImageSet *set, size_t first, size_t last, Progress *progress)
 				t->edges_s = omp_get_wtime() - ts;
 			}
 		} else if (t->job) {
-			/* with edges, the edge map is already in the image: the denoised copy is not needed */
+			/* with edges, the edge map already replaced the image */
 			if (r == IMG_OK && !ed) {
 				nlm_job_finish(&it->job, &out);
 				image_free(&it->img);
@@ -1673,15 +1346,6 @@ io_gpu_filter(ImageSet *set, size_t first, size_t last, Progress *progress)
 	return failed_dn + failed_ed;
 }
 
-/**
- * @brief Frees the buffers of a range of images.
- *
- * Paths, per-stage results and dimensions are kept for benchmarking.
- *
- * @param[in,out] set   Image set.
- * @param[in]     first First image of the range.
- * @param[in]     last  One past the last image of the range.
- */
 void
 io_release(ImageSet *set, size_t first, size_t last)
 {
@@ -1697,14 +1361,6 @@ io_release(ImageSet *set, size_t first, size_t last)
 	}
 }
 
-/**
- * @brief Clears all per-run state, keeping paths and the output format.
- *
- * Call before running the stages again on the same set (e.g. repeated
- * benchmark trials). Releases any remaining buffers.
- *
- * @param[in,out] set Image set.
- */
 void
 io_reset(ImageSet *set)
 {
@@ -1734,18 +1390,6 @@ io_reset(ImageSet *set)
 	memset(&set->gpu_time, 0, sizeof(set->gpu_time));
 }
 
-/**
- * @brief Progress units of one image over the stages that will run.
- *
- * Every I/O and codec stage, and edge detection, counts 1 unit per image,
- * and denoising counts nlm_units() (the number of search offsets, 440 with
- * the defaults), which reflects that it dominates the run time.
- *
- * @param[in] set   Image set (its denoise configuration is used).
- * @param[in] write Non-zero if the encode and write stages will run.
- *
- * @return Units per image.
- */
 size_t
 io_progress_units(const ImageSet *set, int write)
 {
@@ -1759,26 +1403,12 @@ io_progress_units(const ImageSet *set, int write)
 	return u;
 }
 
-/**
- * @brief Returns the short name of a stage ("read", "decode", ...).
- *
- * @param[in] stage STAGE_* value.
- *
- * @return Static name string.
- */
 const char*
 io_stage_name(int stage)
 {
 	return (stage >= 0 && stage < STAGE_COUNT) ? stage_names[stage] : "unknown";
 }
 
-/**
- * @brief Frees all paths and buffers of the set.
- *
- * Safe to call on a zeroed set.
- *
- * @param[in,out] set Image set.
- */
 void
 io_free(ImageSet *set)
 {

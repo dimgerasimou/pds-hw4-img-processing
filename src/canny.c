@@ -1,11 +1,6 @@
 /**
  * @file canny.c
- * @brief CPU implementation of Canny edge detection.
- *
- * The per-pixel arithmetic is in canny_core.h, shared with the GPU. This
- * file computes the Gaussian weights and thresholds, classifies bands of
- * rows with small per-band buffers, and performs hysteresis as a flood fill
- * from the strong edges.
+ * @brief Canny edge detection on the CPU.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -16,20 +11,12 @@
 
 #include "canny.h"
 
-/* ------------------------------------------------------------------------- */
-/*                            Public API Functions                           */
-/* ------------------------------------------------------------------------- */
-
-/**
- * @brief Derives the Gaussian weights and squared thresholds.
- *
- * The weights exp(-i^2 / (2 sigma^2)) are scaled to integers summing to
- * exactly 256. Thresholds are converted to the internal gradient units (the
- * blurred image is in units of 1/256 gray level) and squared.
- *
- * @param[in]  p Parameters (0 <= sigma <= 10, 0 <= low <= high).
- * @param[out] s Setup.
+/*
+ * Above any gradient of an 8-bit image (4 * 255 * sqrt(2) < 1500), so it
+ * still means "no edges", but keeps the squared thresholds from overflowing.
  */
+#define MAX_THRESHOLD 1e6
+
 void
 canny_setup(const CannyParams *p, CannySetup *s)
 {
@@ -58,18 +45,12 @@ canny_setup(const CannyParams *p, CannySetup *s)
 	s->weights[r] += 256 - sum;
 
 	/* internal gradients are in units of 1/256 of the 8-bit image */
-	lo = llround(p->low * 256.0);
-	hi = llround(p->high * 256.0);
+	lo = llround(fmin(p->low, MAX_THRESHOLD) * 256.0);
+	hi = llround(fmin(p->high, MAX_THRESHOLD) * 256.0);
 	s->low2 = lo * lo;
 	s->high2 = hi * hi;
 }
 
-/**
- * @brief Allocates scratch for bands of up to @p band rows of images up to
- *        @p width pixels wide.
- *
- * @return Newly allocated scratch, or NULL on allocation failure.
- */
 CannyScratch*
 canny_scratch_new(int width, int band, int radius)
 {
@@ -95,9 +76,6 @@ canny_scratch_new(int width, int band, int radius)
 	return sc;
 }
 
-/**
- * @brief Frees scratch. Safe to call with NULL.
- */
 void
 canny_scratch_free(CannyScratch *sc)
 {
@@ -109,27 +87,6 @@ canny_scratch_free(CannyScratch *sc)
 	free(sc);
 }
 
-/**
- * @brief Classifies the rows [y0, y1) of an image (steps 1-3).
- *
- * Computes the blur and gradients the band needs, including a border of
- * rows above and below it, in the scratch buffers, and writes CANNY_NONE /
- * CANNY_WEAK / CANNY_EDGE for every pixel of the band into @p map. Bands of
- * the same image, or of different images, may run concurrently with
- * separate scratch. The band's border rows are computed again by the
- * neighboring bands; every value is the same whichever band computes it.
- *
- * Every row an access mirrors to stays within the buffers: mirroring moves
- * an index only across the image border, which the windows reach whenever
- * such an index occurs.
- *
- * @param[in]  img Image (read only).
- * @param[in]  s   Setup from canny_setup().
- * @param[in]  y0  First row of the band.
- * @param[in]  y1  One past the last row.
- * @param[out] map Class map of the whole image (rows [y0, y1) are written).
- * @param[in]  sc  Scratch at least as wide as the image and as tall as the band.
- */
 void
 canny_band(const Image *img, const CannySetup *s, int y0, int y1,
            unsigned char *map, CannyScratch *sc)
@@ -154,24 +111,17 @@ canny_band(const Image *img, const CannySetup *s, int y0, int y1,
 			map[(size_t)y * w + x] = canny_classify(sc->b, lo, w, h, x, y, s->low2, s->high2);
 }
 
-/**
- * @brief Hysteresis on a map of CANNY_NONE / CANNY_WEAK / CANNY_EDGE values:
- *        every weak pixel 8-connected to an edge through weak pixels becomes
- *        an edge; then the map becomes the edge map (255 / 0).
- *
- * @param[in,out] map Class map, w x h; on return the edge map.
- * @param[in]     w   Width.
- * @param[in]     h   Height.
- *
- * @return IMG_OK or IMG_ERR_NOMEM.
- */
 int
 canny_hysteresis(unsigned char *map, int w, int h)
 {
 	const size_t n = (size_t)w * h;
-	size_t *stack = malloc(n * sizeof(size_t));
-	size_t top = 0;
+	size_t *stack, top = 0, cand = 0;
 
+	/* only candidates are ever pushed, each at most once */
+	for (size_t i = 0; i < n; i++)
+		cand += (map[i] != CANNY_NONE);
+
+	stack = malloc((cand ? cand : 1) * sizeof(size_t));
 	if (!stack)
 		return IMG_ERR_NOMEM;
 
@@ -179,7 +129,6 @@ canny_hysteresis(unsigned char *map, int w, int h)
 		if (map[i] == CANNY_EDGE)
 			stack[top++] = i;
 
-	/* every pixel is pushed at most once: when it turns from weak to edge */
 	while (top > 0) {
 		const size_t i = stack[--top];
 		const int x = (int)(i % (size_t)w), y = (int)(i / (size_t)w);
