@@ -39,14 +39,16 @@ extern "C" {
  */
 #define GROUP 4
 #define SEG   4
+static_assert(SEG == 4, "tile_hsum stores its sums as one int4");
 
 /* the program's largest patch radius */
 #define MAX_P 10
 
 struct Tile {
 	unsigned char *img;
-	int *hsum;          /* GROUP x dh x TILE_W */
-	int sw, sh;
+	int *hsum;          /* GROUP x dh x TILE_W, 16-byte aligned */
+	int sw, sh;         /* image tile size */
+	int pitch;          /* bytes per row of the image tile, see tile_pitch() */
 	int s;
 };
 
@@ -56,14 +58,29 @@ struct Tile {
  * tested on the CPU, one thread after the other.
  */
 
+/*
+ * In tile_hsum, a warp reads 4 rows of the image tile, 8 words each. The
+ * pitch makes those rows start 8 or 24 banks apart, so that they fall on
+ * distinct banks: (pitch / 4) % 16 == 8.
+ */
+__host__ __device__ static inline int
+tile_pitch(int sw)
+{
+	int words = (sw + 3) / 4;
+
+	while (words % 16 != 8)
+		words++;
+	return 4 * words;
+}
+
 __host__ __device__ static inline size_t
 tile_bytes(int p, int s)
 {
 	int r = p + s;
-	size_t img = (size_t)(TILE_W + 2 * r) * (TILE_H + 2 * r);
+	size_t img = (size_t)tile_pitch(TILE_W + 2 * r) * (TILE_H + 2 * r);
 	size_t hs = (size_t)GROUP * TILE_W * (TILE_H + 2 * p);
 
-	img = (img + 3) & ~(size_t)3; /* align the int array */
+	img = (img + 15) & ~(size_t)15; /* align the int array for 16-byte stores */
 	return img + hs * sizeof(int);
 }
 
@@ -77,8 +94,9 @@ tile_make(unsigned char *smem, int p, int s)
 	t.s = s;
 	t.sw = TILE_W + 2 * r;
 	t.sh = TILE_H + 2 * r;
+	t.pitch = tile_pitch(t.sw);
 
-	img = ((size_t)t.sw * t.sh + 3) & ~(size_t)3;
+	img = ((size_t)t.pitch * t.sh + 15) & ~(size_t)15;
 	t.img = smem;
 	t.hsum = (int *)(smem + img);
 	return t;
@@ -94,14 +112,14 @@ tile_load(const Tile *t, const unsigned char *pad, int pw, int ph,
 
 		for (int c = tx; c < t->sw; c += BLOCK_W) {
 			const int gc = x0 + c;
-			t->img[r * t->sw + c] = (gr < ph && gc < pw) ? pad[(size_t)gr * pw + gc] : 0;
+			t->img[r * t->pitch + c] = (gr < ph && gc < pw) ? pad[(size_t)gr * pw + gc] : 0;
 		}
 	}
 }
 
 /* (*cx, *cy): running position in the search window, center skipped */
 __host__ __device__ static inline void
-next_offsets(int s, int sw, int *cx, int *cy, int dx[GROUP], int dy[GROUP], int shift[GROUP])
+next_offsets(int s, int pitch, int *cx, int *cy, int dx[GROUP], int dy[GROUP], int shift[GROUP])
 {
 	for (int k = 0; k < GROUP; k++) {
 		if (*cx == 0 && *cy == 0) {
@@ -109,7 +127,7 @@ next_offsets(int s, int sw, int *cx, int *cy, int dx[GROUP], int dy[GROUP], int 
 		}
 		dx[k] = *cx;
 		dy[k] = *cy;
-		shift[k] = *cy * sw + *cx;
+		shift[k] = *cy * pitch + *cx;
 		if (++*cx > s) { *cx = -s; ++*cy; }
 	}
 }
@@ -129,10 +147,11 @@ tile_hsum(const Tile *t, const int shift[GROUP], int tid, int nt)
 		const int rem = item - k * items;
 		const int r = rem / segs;
 		const int x0 = (rem - r * segs) * SEG;
-		const unsigned char *a = t->img + (r + t->s) * t->sw + (x0 + t->s);
+		const unsigned char *a = t->img + (r + t->s) * t->pitch + (x0 + t->s);
 		const unsigned char *b = a + shift[k];
 		int *h = t->hsum + (k * dh + r) * TILE_W + x0;
 		int d[SEG + 2 * P];
+		int hv[SEG];
 		int sum = 0;
 
 		#pragma unroll
@@ -144,13 +163,16 @@ tile_hsum(const Tile *t, const int shift[GROUP], int tid, int nt)
 		#pragma unroll
 		for (int j = 0; j < side; j++)
 			sum += d[j];
-		h[0] = sum;
+		hv[0] = sum;
 
 		#pragma unroll
 		for (int i = 1; i < SEG; i++) {
 			sum += d[i + side - 1] - d[i - 1];
-			h[i] = sum;
+			hv[i] = sum;
 		}
+
+		/* one 16-byte store: a warp's four 4-word stores would conflict 4-way */
+		*(int4 *)h = make_int4(hv[0], hv[1], hv[2], hv[3]);
 	}
 }
 
@@ -206,7 +228,7 @@ nlm_kernel(const unsigned char *__restrict__ pad, int pw, int ph, int w, int h,
            int s, int cutoff, const float *__restrict__ wtab,
            unsigned char *__restrict__ out)
 {
-	extern __shared__ __align__(4) unsigned char smem[];
+	extern __shared__ __align__(16) unsigned char smem[];
 	const Tile t = tile_make(smem, P, s);
 	const int tx = threadIdx.x, ty = threadIdx.y;
 	const int tid = ty * BLOCK_W + tx, nt = BLOCK_W * BLOCK_H;
@@ -225,7 +247,7 @@ nlm_kernel(const unsigned char *__restrict__ pad, int pw, int ph, int w, int h,
 	for (int g = 0; g < noff; g += GROUP) {
 		int dx[GROUP], dy[GROUP], shift[GROUP];
 
-		next_offsets(s, t.sw, &cx, &cy, dx, dy, shift);
+		next_offsets(s, t.pitch, &cx, &cy, dx, dy, shift);
 
 		tile_hsum<P>(&t, shift, tid, nt);
 		__syncthreads();
@@ -238,7 +260,7 @@ nlm_kernel(const unsigned char *__restrict__ pad, int pw, int ph, int w, int h,
 			for (int j = 0; j < PIX_Y; j++)
 				if (ssd[j] <= cutoff)
 					accumulate(__ldg(&wtab[ssd[j]]),
-					           t.img[(ty * PIX_Y + j + r + dy[k]) * t.sw + (tx + r + dx[k])],
+					           t.img[(ty * PIX_Y + j + r + dy[k]) * t.pitch + (tx + r + dx[k])],
 					           &wsum[j], &vsum[j], &wmax[j]);
 		}
 		__syncthreads();                /* everyone done reading the sums */
@@ -249,7 +271,7 @@ nlm_kernel(const unsigned char *__restrict__ pad, int pw, int ph, int w, int h,
 
 		if (x < w && y < h)
 			out[(size_t)y * w + x] =
-				finish(wsum[j], vsum[j], wmax[j], t.img[(ty * PIX_Y + j + r) * t.sw + (tx + r)]);
+				finish(wsum[j], vsum[j], wmax[j], t.img[(ty * PIX_Y + j + r) * t.pitch + (tx + r)]);
 	}
 }
 
