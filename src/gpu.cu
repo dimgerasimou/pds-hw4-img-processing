@@ -7,7 +7,8 @@
  * compute the horizontal patch sums of the group straight from the tile;
  * after a barrier each thread slides a vertical window down its PIX_Y
  * pixels. Those are the CPU's exact integer patch sums, and the weights
- * come from the CPU's table, so with -fmad=false the output is identical.
+ * come from the same nlm_weight() as the CPU's table, so with -fmad=false
+ * the output is identical.
  */
 
 #include <cuda_runtime.h>
@@ -222,10 +223,17 @@ finish(float wsum, float vsum, float wmax, unsigned char center)
 	return (unsigned char)(value < 0 ? 0 : value > 255 ? 255 : value);
 }
 
+/* Blocks per SM to keep: 3 x 512 threads (at most 42 registers), 2 on Turing. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#	define MIN_BLOCKS 2
+#else
+#	define MIN_BLOCKS 3
+#endif
+
 template <int P>
-__global__ void
+__global__ void __launch_bounds__(BLOCK_W * BLOCK_H, MIN_BLOCKS)
 nlm_kernel(const unsigned char *__restrict__ pad, int pw, int ph, int w, int h,
-           int s, int cutoff, const float *__restrict__ wtab,
+           int s, int cutoff, float offset, float scale,
            unsigned char *__restrict__ out)
 {
 	extern __shared__ __align__(16) unsigned char smem[];
@@ -259,7 +267,7 @@ nlm_kernel(const unsigned char *__restrict__ pad, int pw, int ph, int w, int h,
 
 			for (int j = 0; j < PIX_Y; j++)
 				if (ssd[j] <= cutoff)
-					accumulate(__ldg(&wtab[ssd[j]]),
+					accumulate(nlm_weight(ssd[j], offset, scale),
 					           t.img[(ty * PIX_Y + j + r + dy[k]) * t.pitch + (tx + r + dx[k])],
 					           &wsum[j], &vsum[j], &wmax[j]);
 		}
@@ -278,7 +286,8 @@ nlm_kernel(const unsigned char *__restrict__ pad, int pw, int ph, int w, int h,
 template <int P>
 static cudaError_t
 launch(dim3 grid, dim3 block, size_t smem, cudaStream_t stream, const unsigned char *pad,
-       int pw, int ph, int w, int h, int s, int cutoff, const float *wtab, unsigned char *out)
+       int pw, int ph, int w, int h, int s, int cutoff, float offset, float scale,
+       unsigned char *out)
 {
 	if (smem > 48 * 1024) {
 		cudaError_t err = cudaFuncSetAttribute(nlm_kernel<P>,
@@ -288,7 +297,7 @@ launch(dim3 grid, dim3 block, size_t smem, cudaStream_t stream, const unsigned c
 			return err;
 	}
 
-	nlm_kernel<P><<<grid, block, smem, stream>>>(pad, pw, ph, w, h, s, cutoff, wtab, out);
+	nlm_kernel<P><<<grid, block, smem, stream>>>(pad, pw, ph, w, h, s, cutoff, offset, scale, out);
 	return cudaGetLastError();
 }
 
@@ -500,10 +509,10 @@ struct Buf {
 struct Slot {
 	cudaStream_t stream;
 	cudaEvent_t ev[EV_COUNT];
-	Buf d_pad, d_tab, d_out;
+	Buf d_pad, d_out;
 	Buf e_img, e_hb, e_b, e_map, e_act[2];
 	Buf e_flag;                            /* changed flag, tile counter */
-	Buf h_in, h_tab, h_out, h_flag;        /* pinned */
+	Buf h_in, h_out, h_flag;               /* pinned */
 	GpuTask *task;
 	int denoise, edges;
 	int launches;
@@ -586,23 +595,17 @@ slot_stage(Slot *s, GpuTask *t, int edges)
 
 	if (s->denoise) {
 		const size_t npad = c->pw * ((size_t)c->h + 2 * (c->p + c->s));
-		const size_t ntab = ((size_t)c->cutoff + 2) * sizeof(float);
 
 		if (host_reserve(&s->h_in, npad, "cudaHostAlloc (image)")
-		    || host_reserve(&s->h_tab, ntab, "cudaHostAlloc (weights)")
 		    || dev_reserve(&s->d_pad, npad, "cudaMalloc (image)")
-		    || dev_reserve(&s->d_tab, ntab, "cudaMalloc (weights)")
 		    || dev_reserve(&s->d_out, n, "cudaMalloc (output)"))
 			return IMG_ERR_GPU;
 
 		memcpy(s->h_in.p, c->pad, npad);
-		memcpy(s->h_tab.p, c->wtab, ntab);
 
 		cudaEventRecord(s->ev[EV_UP0], s->stream);
 		if (cuda_failed(cudaMemcpyAsync(s->d_pad.p, s->h_in.p, npad, cudaMemcpyHostToDevice,
-		                                s->stream), "upload (image)")
-		    || cuda_failed(cudaMemcpyAsync(s->d_tab.p, s->h_tab.p, ntab, cudaMemcpyHostToDevice,
-		                                   s->stream), "upload (weights)"))
+		                                s->stream), "upload (image)"))
 			return IMG_ERR_GPU;
 	} else if (edges) {
 		/* the image, or the output of a job with nothing to denoise */
@@ -647,7 +650,7 @@ slot_kernels(Slot *s, const CannySetup *cs)
 		switch (c->p) {
 #define CASE(P) case P: err = launch<P>(grid, block, smem, s->stream, (unsigned char *)s->d_pad.p, \
 		                                (int)c->pw, (int)c->h + 2 * r, (int)c->w, (int)c->h, c->s, \
-		                                c->cutoff, (float *)s->d_tab.p, (unsigned char *)s->d_out.p); break;
+		                                c->cutoff, c->off_f, c->scale_f, (unsigned char *)s->d_out.p); break;
 		CASE(0) CASE(1) CASE(2) CASE(3) CASE(4) CASE(5)
 		CASE(6) CASE(7) CASE(8) CASE(9) CASE(10)
 #undef CASE
@@ -919,9 +922,9 @@ gpu_shutdown(void)
 
 	for (int i = 0; i < SLOTS; i++) {
 		Slot *s = &slots[i];
-		Buf *dev[] = { &s->d_pad, &s->d_tab, &s->d_out, &s->e_img, &s->e_hb, &s->e_b,
+		Buf *dev[] = { &s->d_pad, &s->d_out, &s->e_img, &s->e_hb, &s->e_b,
 		               &s->e_map, &s->e_act[0], &s->e_act[1], &s->e_flag };
-		Buf *host[] = { &s->h_in, &s->h_tab, &s->h_out, &s->h_flag };
+		Buf *host[] = { &s->h_in, &s->h_out, &s->h_flag };
 
 		cudaStreamSynchronize(s->stream);
 		for (size_t k = 0; k < sizeof(dev) / sizeof(dev[0]); k++)
@@ -957,7 +960,7 @@ gpu_run(GpuTask *tasks, size_t n, const CannySetup *cs, GpuTiming *timing,
 		t->status = GPU_PENDING;
 		t->denoise_s = t->edges_s = 0.0;
 
-		if (dn && (!t->job->ctx.wtab || t->job->ctx.p > MAX_P))
+		if (dn && t->job->ctx.p > MAX_P)
 			t->status = IMG_ERR_UNSUPPORTED;
 		else if (!dn && !cs)
 			t->status = IMG_OK;  /* denoising only, no noise: output already set */

@@ -26,7 +26,7 @@
 /* exp(-30) ~ 1e-13: smaller weights cannot change an 8-bit result */
 #define NLM_MAX_ARG 30.0
 
-/* Beyond this (strong noise, big patches), weights come from expf() directly. */
+/* Beyond this (strong noise, big patches), weights are computed directly. */
 #define NLM_MAX_TABLE (1L << 22)
 
 /* Chunk of pixels skipped at once when all its candidates are rejected. */
@@ -80,8 +80,7 @@ pad_image(const Image *src, unsigned int r, int parallel, size_t *pw)
 static inline float
 weight(const NlmContext *c, int ssd)
 {
-	double arg = ((double)ssd - c->offset) * c->inv;
-	return expf(-(float)(arg > 0.0 ? arg : 0.0));
+	return nlm_weight(ssd, c->off_f, c->scale_f);
 }
 
 /* Sums beyond the cutoff map to the table's last entry, which is 0. */
@@ -379,6 +378,8 @@ nlm_job_prepare(const Image *src, const NlmParams *p, long band, int parallel,
 	/* in patch sums: (d^2 - 2 sigma^2) / h^2 == (ssd - offset) * inv */
 	c->offset = 2.0 * sigma * sigma * area;
 	c->inv = 1.0 / (h * h * area);
+	c->off_f = (float)c->offset;
+	c->scale_f = (float)(c->inv * 1.4426950408889634); /* 1 / ln 2 */
 
 	/* weights are negligible beyond; an int, so the loops compare integers */
 	cut = floor(c->offset + NLM_MAX_ARG / c->inv);

@@ -33,7 +33,8 @@ NVCC_GENCODE :=
 $(foreach arch,$(GPU_ARCHES),$(eval NVCC_GENCODE += -gencode arch=compute_$(arch),code=sm_$(arch)))
 
 CPPFLAGS ?=
-CFLAGS   ?= -Wall -Wextra -Wpedantic -O3 -fopenmp
+# no fused multiply-add, so the CPU's results match the GPU's bit for bit
+CFLAGS   ?= -Wall -Wextra -Wpedantic -O3 -fopenmp -ffp-contract=off
 LDFLAGS  ?= -fopenmp
 LDLIBS   ?= -lm
 

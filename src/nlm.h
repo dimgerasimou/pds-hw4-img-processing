@@ -20,6 +20,7 @@
 #include <stdint.h>
 
 #include "image.h"
+#include "nlm_core.h"
 #include "progress.h"
 
 typedef struct {
@@ -39,8 +40,9 @@ typedef struct {
 	int s;
 	double offset;            /* 2 sigma^2 * patch area */
 	double inv;               /* 1 / (h^2 * patch area) */
+	float off_f, scale_f;     /* arguments of nlm_weight(): offset, inv / ln 2 */
 	int cutoff;               /* largest patch sum with a non-negligible weight */
-	const float *wtab;        /* weights for patch sums 0..cutoff+1, or NULL */
+	const float *wtab;        /* CPU: weights for patch sums 0..cutoff+1, or NULL */
 } NlmContext;
 
 typedef struct {
