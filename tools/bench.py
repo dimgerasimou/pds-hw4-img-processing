@@ -354,7 +354,8 @@ def quality_chunk(args, res, work, noisy, clean, gpu, tag):
         if code != 0:
             sys.exit(f"bench.py: quality run {name!r} failed ({code}): {err.strip()[-300:]}")
         if name == "denoised":
-            sig = json.load(open(bench))["denoise"]["sigma_used"]
+            j = json.load(open(bench))["denoise"]
+            sig = {"mean": j["sigma_used"]["mean"], "strength": j.get("strength_used", {}).get("mean")}
 
     ref = compare.images(normalize(args, work, clean, "reference"))
     nz = compare.images(normalize(args, work, noisy, "input"))
@@ -436,7 +437,9 @@ def quality(args, res, noisy, clean, gpu):
             / max(1, sum(r["image"] in manifest for r in rows))
     total = sum(n for n, _ in sigmas)
     estimated = sum(n * sg["mean"] for n, sg in sigmas) / total
-    return rows, {"added": added, "estimated": estimated}, checks, len(ref) - len(rows)
+    hs = [(n, sg["strength"]) for n, sg in sigmas if sg.get("strength")]
+    strength = sum(n * h for n, h in hs) / sum(n for n, _ in hs) if hs else None
+    return rows, {"added": added, "estimated": estimated, "strength": strength}, checks, len(ref) - len(rows)
 
 
 # ---------------------------------------------------------------- report
@@ -525,11 +528,13 @@ def summary(batch_rows, thread_rows, qual, noise_lv, checks, filters, skipped=0)
         if noise_lv.get("estimated") is not None:
             if noise_lv.get("added") is not None:
                 md.append(f"Noise level: added {noise_lv['added']:.2f}, used by imgfilter "
-                          f"{noise_lv['estimated']:.2f} (mean std, gray levels).\n")
+                          f"{noise_lv['estimated']:.2f} (mean std, gray levels)"
+                          + (f"; strength h/sigma {noise_lv['strength']:.2f}" if noise_lv.get("strength") else "") + ".\n")
             else:
                 md.append(f"Noise level used by imgfilter: {noise_lv['estimated']:.2f} "
                           "(mean std, gray levels; its estimate, or what -N made of it; "
-                          "real data, no added noise to compare with).\n")
+                          "real data, no added noise to compare with)"
+                          + (f"; strength h/sigma {noise_lv['strength']:.2f}" if noise_lv.get("strength") else "") + ".\n")
         for k, v in checks.items():
             md.append(f"- {k}: **{'yes' if v else 'NO'}**")
         md.append("")

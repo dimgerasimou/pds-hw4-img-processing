@@ -264,8 +264,9 @@ integral_band(const NlmContext *c, long y0, long y1, uint32_t *ii, float *acc,
 	}
 }
 
-double
-nlm_noise_estimate(const Image *img, int parallel)
+/* Immerkaer's estimate: the mean absolute high-pass response. Summed in integers. */
+static double
+immerkaer(const Image *img, int parallel)
 {
 	const long W = (long)img->width;
 	const long H = (long)img->height;
@@ -292,6 +293,119 @@ nlm_noise_estimate(const Image *img, int parallel)
 	}
 
 	return sqrt(M_PI / 2.0) * (double)sum / (6.0 * (double)(W - 2) * (double)(H - 2));
+}
+
+#define FLAT_B          16     /* block side */
+#define FLAT_QUANTILE   0.10   /* quantile of the block variances that gives sigma */
+#define FLAT_WEIGHT     0.9    /* flat estimates count for this much against Immerkaer's */
+#define FLAT_MIN        5.0    /* weighted flat estimates below this are ignored: the fine texture
+                                  and detector noise of an image itself (3 to 4 gray levels in
+                                  radiographs) cannot be told from mild correlated noise */
+
+#define STRENGTH_WHITE       0.4   /* h / sigma for white noise */
+#define STRENGTH_CORRELATED  1.0   /* h / sigma for correlated noise */
+#define EXCESS_WHITE         1.10  /* below this excess the noise counts as white */
+#define EXCESS_CORRELATED    1.30  /* above it, as correlated */
+
+static int
+cmp_double(const void *a, const void *b)
+{
+	double x = *(const double *)a, y = *(const double *)b;
+
+	return (x > y) - (x < y);
+}
+
+/*
+ * Standard deviation of the noise in the flattest blocks: the FLAT_QUANTILE
+ * quantile of the variances left after a plane fit. Blocks that are constant
+ * or clipped (more than 5% of the pixels at 0 or 255) are left out.
+ * Returns 0 if fewer than 8 blocks remain.
+ */
+static int
+flat_noise(const Image *img, int parallel, double *sigma)
+{
+	const long W = (long)img->width, B = FLAT_B;
+	const long nbx = W / B, nby = (long)img->height / B, nb = nbx * nby;
+	const double n = (double)(B * B), sxx = (double)B * (double)B * ((double)B * B - 1.0) / 12.0;
+	const double mid = 0.5 * (double)(B - 1);
+	double *var;
+	size_t nv = 0;
+
+	if (nb < 16)
+		return 0;
+
+	var = malloc((size_t)nb * sizeof(*var));
+	if (!var)
+		return 0;
+
+	#pragma omp parallel for schedule(static) if(parallel)
+	for (long k = 0; k < nb; k++) {
+		const unsigned char *p = img->data + (size_t)(k / nbx * B) * W + (size_t)(k % nbx * B);
+		double sz = 0, szz = 0, szx = 0, szy = 0;
+		long clipped = 0;
+
+		for (long y = 0; y < B; y++)
+			for (long x = 0; x < B; x++) {
+				double z = p[y * W + x];
+				sz += z;
+				szz += z * z;
+				szx += z * ((double)x - mid);
+				szy += z * ((double)y - mid);
+				clipped += (p[y * W + x] == 0 || p[y * W + x] == 255);
+			}
+
+		double mean = sz / n, bx = szx / sxx, by = szy / sxx;
+		double tot = szz - n * mean * mean;
+
+		if (tot / n < 0.0025 || clipped * 20 > B * B)
+			var[k] = -1.0;                                  /* constant or clipped */
+		else
+			var[k] = (tot - (bx * bx + by * by) * sxx) / (n - 3.0);   /* plane removed */
+	}
+
+	for (long k = 0; k < nb; k++)
+		if (var[k] >= 0.0)
+			var[nv++] = var[k];
+
+	if (nv >= 8) {
+		double pos = FLAT_QUANTILE * (double)(nv - 1), v;
+		size_t i = (size_t)pos;
+
+		qsort(var, nv, sizeof(*var), cmp_double);
+		v = i + 1 < nv ? var[i] + (pos - (double)i) * (var[i + 1] - var[i]) : var[i];
+		*sigma = sqrt(v > 0.0 ? v : 0.0);
+		free(var);
+		return 1;
+	}
+
+	free(var);
+	return 0;
+}
+
+NlmNoise
+nlm_noise_estimate(const Image *img, int parallel)
+{
+	NlmNoise n = { immerkaer(img, parallel), 1.0 };
+	double sigma;
+
+	if (flat_noise(img, parallel, &sigma) && FLAT_WEIGHT * sigma >= FLAT_MIN) {
+		sigma *= FLAT_WEIGHT;
+		if (n.sigma > 0.0)
+			n.excess = sigma / n.sigma;
+		if (sigma > n.sigma)
+			n.sigma = sigma;
+	}
+	return n;
+}
+
+/* h / sigma for an image whose two noise estimates differ by @p excess. */
+static double
+auto_strength(double excess)
+{
+	double t = (excess - EXCESS_WHITE) / (EXCESS_CORRELATED - EXCESS_WHITE);
+
+	t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+	return STRENGTH_WHITE + t * (STRENGTH_CORRELATED - STRENGTH_WHITE);
 }
 
 NlmScratch*
@@ -332,22 +446,34 @@ nlm_scratch_free(NlmScratch *s)
 
 int
 nlm_job_prepare(const Image *src, const NlmParams *p, long band, int parallel,
-                NlmJob *job, double *sigma_out)
+                NlmJob *job, double *sigma_out, double *strength_out)
 {
 	const long W = (long)src->width;
 	const long H = (long)src->height;
 	const double area = (double)(2 * p->patch + 1) * (double)(2 * p->patch + 1);
 	NlmContext *c = &job->ctx;
-	double sigma, h, cut;
+	double sigma, strength = p->h_factor, h, cut;
 
 	memset(job, 0, sizeof(*job));
 
 	if (!src->data || W == 0 || H == 0 || band <= 0)
 		return IMG_ERR_SIZE;
 
-	sigma = (p->sigma >= 0.0) ? p->sigma : p->sigma_scale * nlm_noise_estimate(src, parallel);
+	if (p->sigma >= 0.0) {
+		sigma = p->sigma;
+	} else {
+		NlmNoise noise = nlm_noise_estimate(src, parallel);
+
+		sigma = p->sigma_scale * noise.sigma;
+		if (strength <= 0.0)
+			strength = auto_strength(noise.excess);
+	}
+	if (strength <= 0.0)
+		strength = STRENGTH_WHITE;
 	if (sigma_out)
 		*sigma_out = sigma;
+	if (strength_out)
+		*strength_out = strength;
 
 	job->out.data = malloc((size_t)W * H);
 	if (!job->out.data)
@@ -356,7 +482,7 @@ nlm_job_prepare(const Image *src, const NlmParams *p, long band, int parallel,
 	job->out.height = src->height;
 	job->band = band;
 
-	h = p->h_factor * sigma;
+	h = strength * sigma;
 	if (h <= 0.0) {
 		memcpy(job->out.data, src->data, (size_t)W * H);
 		job->bands = 0;

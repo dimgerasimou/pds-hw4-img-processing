@@ -53,6 +53,9 @@ typedef struct {
 	double sigma_mean;
 	double sigma_min;
 	double sigma_max;
+	double strength_mean;
+	double strength_min;
+	double strength_max;
 } DenoiseInfo;
 
 enum {

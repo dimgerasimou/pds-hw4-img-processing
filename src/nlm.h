@@ -26,7 +26,7 @@
 typedef struct {
 	unsigned int patch;  /* radius */
 	unsigned int search; /* radius */
-	double h_factor;     /* h = h_factor * sigma */
+	double h_factor;     /* h = h_factor * sigma; 0: automatic, see nlm_noise_estimate() */
 	double sigma;        /* < 0: estimate per image */
 	double sigma_scale;  /* multiplies the estimate */
 } NlmParams;
@@ -74,9 +74,15 @@ void nlm_scratch_free(NlmScratch *s);
  * Estimates the noise unless given, pads the image, builds the weight table
  * and allocates the output. With @p parallel set, these steps use all
  * threads. @p src must outlive the job.
+ *
+ * Without p->h_factor, the strength is 0.4 for white noise, which the
+ * estimate of the image implies unless given; it rises to 1.0 as excess goes
+ * from 1.1 to 1.3, since correlated noise makes patch distances fluctuate
+ * more and needs a larger tolerance. @p sigma_out and @p strength_out
+ * (h / sigma) receive what was used; either may be NULL.
  */
 int nlm_job_prepare(const Image *src, const NlmParams *p, long band, int parallel,
-                    NlmJob *job, double *sigma_out);
+                    NlmJob *job, double *sigma_out, double *strength_out);
 
 long nlm_job_bands(const NlmJob *job);
 
@@ -102,12 +108,26 @@ size_t nlm_units(const NlmParams *p);
 /** @brief Share of @p units for band @p b; the shares add up to @p units. */
 size_t nlm_band_units(size_t units, long b, long bands);
 
+/** @brief What nlm_noise_estimate() finds out about the noise of an image. */
+typedef struct {
+	double sigma;    /**< standard deviation, in gray levels */
+	double excess;   /**< the flat-block estimate over Immerkaer's: about 1 or less for white noise */
+} NlmNoise;
+
 /**
- * @brief Estimates the noise standard deviation (Immerkaer).
+ * @brief Estimates the noise of an image.
  *
- * Summed in integers, so the result does not depend on the thread count.
- * Texture counts partly as noise. Returns 0 for images smaller than 3x3.
+ * The larger of two estimates. Immerkaer's measures the finest scale: exact
+ * for white noise, but it reads correlated noise (CT reconstructions, for
+ * one) several times too low. The second takes the variance of the flattest
+ * 16x16 blocks after a plane fit, which includes noise of any correlation;
+ * it is scaled by 0.9 to leave white noise to the first, and ignored below 5
+ * gray levels, where noise cannot be told from the texture of the image. excess is the
+ * ratio of the two, 1 if no flat blocks could be found: well above 1, the
+ * noise is not white, and the filter needs a larger tolerance h (see
+ * nlm_job_prepare()). Texture counts partly as noise. Does not depend on the
+ * thread count. Returns zeros for images smaller than 3x3.
  */
-double nlm_noise_estimate(const Image *img, int parallel);
+NlmNoise nlm_noise_estimate(const Image *img, int parallel);
 
 #endif /* NLM_H */

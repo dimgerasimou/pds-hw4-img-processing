@@ -54,6 +54,7 @@ typedef struct {
 	unsigned int width;            /* kept after the pixels are released */
 	unsigned int height;
 	double sigma;                  /* noise level used by denoising */
+	double strength;               /* h / sigma used by denoising */
 	size_t units;                  /* progress units of its denoising */
 	NlmJob job;                    /* GPU: prepared on the CPU, run on the GPU */
 	int err[STAGE_COUNT];          /* IMG_* or IO_NOT_DONE */

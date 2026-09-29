@@ -653,7 +653,7 @@ denoise_bands(ImageSet *set, size_t first, size_t last, Progress *progress)
 		ts = omp_get_wtime();
 		it->err[STAGE_DENOISE] = nlm_job_prepare(&it->img, p,
 		                                         band_rows((long)it->img.height, band, few, threads),
-		                                         few, &jobs[k], &it->sigma);
+		                                         few, &jobs[k], &it->sigma, &it->strength);
 		it->time_s[STAGE_DENOISE] = omp_get_wtime() - ts;
 
 		if (it->err[STAGE_DENOISE] != IMG_OK) {
@@ -1153,7 +1153,7 @@ io_prepare(ImageSet *set, size_t first, size_t last, Progress *progress)
 		it->bytes[STAGE_DENOISE] = image_bytes(&it->img);
 		ts = omp_get_wtime();
 		it->err[STAGE_DENOISE] = nlm_job_prepare(&it->img, p, (long)it->img.height, few,
-		                                         &it->job, &it->sigma);
+		                                         &it->job, &it->sigma, &it->strength);
 		it->time_s[STAGE_DENOISE] = omp_get_wtime() - ts;
 
 		if (it->err[STAGE_DENOISE] != IMG_OK) {
@@ -1371,7 +1371,7 @@ io_reset(ImageSet *set)
 
 		it->in_format = IMG_FMT_UNKNOWN;
 		it->width = it->height = 0;
-		it->sigma = 0.0;
+		it->sigma = it->strength = 0.0;
 		it->detail = NULL;
 
 		for (int s = 0; s < STAGE_COUNT; s++) {

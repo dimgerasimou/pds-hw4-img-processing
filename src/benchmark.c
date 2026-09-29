@@ -173,7 +173,7 @@ static void
 getdenoiseinfo(Benchmark *b, const ImageSet *set)
 {
 	DenoiseInfo *d = &b->denoise_info;
-	double sum = 0.0;
+	double sum = 0.0, hsum = 0.0;
 	size_t n = 0;
 
 	for (size_t i = 0; i < set->count; i++) {
@@ -184,11 +184,15 @@ getdenoiseinfo(Benchmark *b, const ImageSet *set)
 
 		if (n == 0 || it->sigma < d->sigma_min) d->sigma_min = it->sigma;
 		if (n == 0 || it->sigma > d->sigma_max) d->sigma_max = it->sigma;
+		if (n == 0 || it->strength < d->strength_min) d->strength_min = it->strength;
+		if (n == 0 || it->strength > d->strength_max) d->strength_max = it->strength;
 		sum += it->sigma;
+		hsum += it->strength;
 		n++;
 	}
 
 	d->sigma_mean = n ? sum / n : 0.0;
+	d->strength_mean = n ? hsum / n : 0.0;
 }
 
 static void

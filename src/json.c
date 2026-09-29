@@ -143,7 +143,10 @@ print_denoise_info(FILE *f, const DenoiseInfo *info, const unsigned int indent_l
 	fprintf(f, "%*s\"device\": \"%s\",\n", indent_level + 2, "", info->gpu ? "cuda" : "cpu");
 	fprintf(f, "%*s\"patch_radius\": %u,\n", indent_level + 2, "", c->params.patch);
 	fprintf(f, "%*s\"search_radius\": %u,\n", indent_level + 2, "", c->params.search);
-	fprintf(f, "%*s\"h_factor\": %.4f,\n", indent_level + 2, "", c->params.h_factor);
+	if (c->params.h_factor > 0.0)
+		fprintf(f, "%*s\"h_factor\": %.4f,\n", indent_level + 2, "", c->params.h_factor);
+	else
+		fprintf(f, "%*s\"h_factor\": \"auto\",\n", indent_level + 2, "");
 	fprintf(f, "%*s\"sigma\": ", indent_level + 2, "");
 	if (c->params.sigma >= 0.0)
 		fprintf(f, "%.4f,\n", c->params.sigma);
@@ -151,8 +154,10 @@ print_denoise_info(FILE *f, const DenoiseInfo *info, const unsigned int indent_l
 		fprintf(f, "\"estimated x %.4f\",\n", c->params.sigma_scale);
 	else
 		fputs("\"estimated\",\n", f);
-	fprintf(f, "%*s\"sigma_used\": { \"mean\": %.4f, \"min\": %.4f, \"max\": %.4f }\n",
+	fprintf(f, "%*s\"sigma_used\": { \"mean\": %.4f, \"min\": %.4f, \"max\": %.4f },\n",
 	        indent_level + 2, "", info->sigma_mean, info->sigma_min, info->sigma_max);
+	fprintf(f, "%*s\"strength_used\": { \"mean\": %.4f, \"min\": %.4f, \"max\": %.4f }\n",
+	        indent_level + 2, "", info->strength_mean, info->strength_min, info->strength_max);
 	fprintf(f, "%*s}", indent_level, "");
 }
 

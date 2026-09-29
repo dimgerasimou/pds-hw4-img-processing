@@ -2,18 +2,19 @@
 """
 tune.py - Find good NLM denoising settings for images with a known truth.
 
-imgfilter estimates the noise level of every image by itself. When the noise
-is spatially correlated, as in CT reconstructions, that estimate can be far
-too low and the filter then does almost nothing (2DeteCT: +0.03 dB with the
-defaults, about +8 dB with tuned settings). tune.py runs a grid of settings
-on a small sample of image pairs and prints the PSNR each one reaches, so
-that the best can be given to imgfilter, or to bench.py with --nlm "...".
+imgfilter estimates the noise level and picks the strength for every image by
+itself, and this is right for most noise, including the spatially correlated
+noise of CT reconstructions. tune.py runs a grid of settings on a small
+sample of image pairs and prints the PSNR each one reaches, next to the
+automatic setting, to show whether anything beats it for your data. The best
+can be given to imgfilter, or to bench.py with --nlm "...".
 
 The settings (imgfilter options):
-  -N <sigma>  noise level in gray levels, or "5x" for 5 times the automatic
-              estimate (which follows the noise level of every image)
-  -H <k>      strength: the filter tolerates patch differences of about k * sigma
-  -P <r>      patch radius; larger patches suit correlated noise
+  -N <sigma>  noise level in gray levels, or "1.5x" for 1.5 times the
+              automatic estimate (which follows the noise of every image)
+  -H <k>      strength: the filter tolerates patch differences of about
+              k * sigma; "auto" leaves it to imgfilter (0.4 to 1.0)
+  -P <r>      patch radius
   -S <r>      search radius
 
 Pairs are given as for bench.py: --reference DIR holds the truth, files match
@@ -24,7 +25,7 @@ images (bench.py --nlm "..." with another --seed).
 
 Examples:
   tools/tune.py --reference data/full data/low
-  tools/tune.py --reference data/full --sample 40 --sigma 4x,6x,8x --strength 0.8,1.2 data/low
+  tools/tune.py --reference data/full --sample 40 --sigma 0.7x,1x,1.5x --strength auto,1.2 data/low
   tools/tune.py --reference data/full --gpu --patch 2,3,4,5 data/low
 """
 
@@ -86,10 +87,10 @@ def main():
     ap.add_argument("--pairs", type=Path, help='CSV of "input,reference" file names')
     ap.add_argument("--sample", type=int, default=20, help="image pairs to use (default: 20)")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--sigma", type=str_list, default=["1x", "3x", "5x", "8x"],
-                    help='values of -N: numbers, or factors like 5x (default: 1x,3x,5x,8x)')
-    ap.add_argument("--strength", type=str_list, default=["0.4", "0.8", "1.2"],
-                    help="values of -H (default: 0.4,0.8,1.2)")
+    ap.add_argument("--sigma", type=str_list, default=["0.7x", "1x", "1.4x"],
+                    help='values of -N: numbers, or factors like 1.4x (default: 0.7x,1x,1.4x)')
+    ap.add_argument("--strength", type=str_list, default=["auto", "0.4", "0.8", "1.2"],
+                    help="values of -H, or auto (default: auto,0.4,0.8,1.2)")
     ap.add_argument("--patch", type=int_list, default=[2, 3, 4], help="values of -P (default: 2,3,4)")
     ap.add_argument("--search", type=int_list, default=[10], help="values of -S (default: 10)")
     ap.add_argument("--gpu", action="store_true", help="run imgfilter on the GPU (-g)")
@@ -142,7 +143,7 @@ def main():
         results = []
         for n, (sg, h, p, s) in enumerate(grid, 1):
             shutil.rmtree(out, ignore_errors=True)
-            denoise(args, ["-N", sg, "-H", h, "-P", str(p), "-S", str(s)], indir, out)
+            denoise(args, ["-N", sg, *([] if h == "auto" else ["-H", h]), "-P", str(p), "-S", str(s)], indir, out)
             v = mean_psnr(refs, out)
             results.append((v, sg, h, p, s))
             print(f"[{n}/{len(grid)}] -N {sg} -H {h} -P {p} -S {s}: {v:.2f} dB", file=sys.stderr, flush=True)
@@ -154,13 +155,14 @@ def main():
     for i, (v, sg, h, p, s) in enumerate(results[:args.top], 1):
         print(f"{i:3d} {sg:>8s}{h:>6s}{p:>4d}{s:>4d}{v:>10.2f}{v - noisy:>+9.2f}")
     v, sg, h, p, s = results[0]
-    print(f"\nbest: imgfilter -d -N {sg} -H {h} -P {p} -S {s} ...   "
-          f'bench.py --nlm "-N {sg} -H {h} -P {p} -S {s}" ...')
+    flags = f"-N {sg} " + ("" if h == "auto" else f"-H {h} ") + f"-P {p} -S {s}"
+    print(f"\nautomatic setting: {auto:.2f} dB; best of the grid: {v:.2f} dB ({v - auto:+.2f} dB)")
+    print(f"best: imgfilter -d {flags} ...   " + f'bench.py --nlm "{flags}" ...')
     edge = []   # parameters whose best value is the largest one tried
     for name, value, tried, key in (("--sigma", sg, args.sigma, lambda x: float(x.rstrip("xX"))),
-                                    ("--strength", h, args.strength, float),
+                                    ("--strength", h, [t for t in args.strength if t != "auto"], float),
                                     ("--patch", p, args.patch, int)):
-        if len(set(tried)) > 1 and max(tried, key=key) == value:
+        if len(set(tried)) > 1 and value == max(tried, key=key):
             edge.append(name)
     if edge:
         print(f"note: the best setting is the largest value tried for {', '.join(edge)}; "

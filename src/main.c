@@ -29,7 +29,7 @@
 /* Buades et al. (IPOL 2011), for moderate noise */
 #define DEFAULT_NLM_PATCH  2
 #define DEFAULT_NLM_SEARCH 10
-#define DEFAULT_NLM_H      0.4
+#define DEFAULT_NLM_H      0.0   /* automatic */
 #define DEFAULT_NLM_SIGMA  -1.0 /* estimate per image */
 
 #define DEFAULT_CANNY_SIGMA 1.4
