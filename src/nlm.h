@@ -75,9 +75,9 @@ void nlm_scratch_free(NlmScratch *s);
  * and allocates the output. With @p parallel set, these steps use all
  * threads. @p src must outlive the job.
  *
- * Without p->h_factor, the strength is 0.4 for white noise, which the
- * estimate of the image implies unless given; it rises to 1.0 as excess goes
- * from 1.1 to 1.3, since correlated noise makes patch distances fluctuate
+ * Without p->h_factor, the strength is 0.7 for white noise, and rises to 1.2
+ * and then 1.6 as the excess of the noise estimate grows (see
+ * nlm_noise_estimate()): correlated noise makes patch distances fluctuate
  * more and needs a larger tolerance. @p sigma_out and @p strength_out
  * (h / sigma) receive what was used; either may be NULL.
  */

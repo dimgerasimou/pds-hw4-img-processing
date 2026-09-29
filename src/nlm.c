@@ -302,10 +302,17 @@ immerkaer(const Image *img, int parallel)
                                   and detector noise of an image itself (3 to 4 gray levels in
                                   radiographs) cannot be told from mild correlated noise */
 
-#define STRENGTH_WHITE       0.4   /* h / sigma for white noise */
-#define STRENGTH_CORRELATED  1.0   /* h / sigma for correlated noise */
-#define EXCESS_WHITE         1.10  /* below this excess the noise counts as white */
-#define EXCESS_CORRELATED    1.30  /* above it, as correlated */
+/*
+ * h / sigma by excess, the ratio of the two noise estimates: linear between
+ * the points. Measured as the strength with the best PSNR: about 0.6 to 0.8
+ * for white Gaussian noise (0.8 for Poisson), 1.2 for the noise of filtered
+ * back-projection, and 1.6 for the correlated noise of a CT reconstruction
+ * (2DeteCT), which has an excess of 5.
+ */
+static const double strength_by_excess[][2] = {
+	{ 1.05, 0.7 }, { 1.25, 1.2 }, { 1.50, 1.2 }, { 3.00, 1.6 },
+};
+#define STRENGTH_DEFAULT  0.7   /* for an explicit -N without -H: what white noise gets */
 
 static int
 cmp_double(const void *a, const void *b)
@@ -402,10 +409,17 @@ nlm_noise_estimate(const Image *img, int parallel)
 static double
 auto_strength(double excess)
 {
-	double t = (excess - EXCESS_WHITE) / (EXCESS_CORRELATED - EXCESS_WHITE);
+	const size_t n = sizeof(strength_by_excess) / sizeof(strength_by_excess[0]);
 
-	t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
-	return STRENGTH_WHITE + t * (STRENGTH_CORRELATED - STRENGTH_WHITE);
+	if (excess <= strength_by_excess[0][0])
+		return strength_by_excess[0][1];
+	for (size_t i = 1; i < n; i++)
+		if (excess <= strength_by_excess[i][0]) {
+			double t = (excess - strength_by_excess[i - 1][0])
+			           / (strength_by_excess[i][0] - strength_by_excess[i - 1][0]);
+			return strength_by_excess[i - 1][1] + t * (strength_by_excess[i][1] - strength_by_excess[i - 1][1]);
+		}
+	return strength_by_excess[n - 1][1];
 }
 
 NlmScratch*
@@ -469,7 +483,7 @@ nlm_job_prepare(const Image *src, const NlmParams *p, long band, int parallel,
 			strength = auto_strength(noise.excess);
 	}
 	if (strength <= 0.0)
-		strength = STRENGTH_WHITE;
+		strength = STRENGTH_DEFAULT;
 	if (sigma_out)
 		*sigma_out = sigma;
 	if (strength_out)
