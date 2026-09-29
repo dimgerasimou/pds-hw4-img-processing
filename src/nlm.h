@@ -28,6 +28,7 @@ typedef struct {
 	unsigned int search; /* radius */
 	double h_factor;     /* h = h_factor * sigma */
 	double sigma;        /* < 0: estimate per image */
+	double sigma_scale;  /* multiplies the estimate */
 } NlmParams;
 
 /* Per-image values shared by all bands of a job. */

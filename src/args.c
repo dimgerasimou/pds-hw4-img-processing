@@ -48,7 +48,9 @@ usage(void)
 		"  -P <radius>        Patch radius, patches are (2r+1)^2   (default: 2)\n"
 		"  -S <radius>        Search radius, window is (2r+1)^2    (default: 10)\n"
 		"  -H <k>             Strength, h = k * sigma              (default: 0.4)\n"
-		"  -N <sigma>         Noise standard deviation (default: estimated per image)\n\n"
+		"  -N <sigma>         Noise standard deviation (default: estimated per image)\n"
+		"  -N <f>x            f times the estimated noise, when the estimate is too low\n"
+		"                     (noise that is spatially correlated)\n\n"
 		"Edge detection (Canny), after denoising if both are enabled:\n"
 		"  -e                 Enable; the output is the edge map (255 = edge)\n"
 		"  -G <sigma>         Gaussian blur standard deviation, 0 = none (default: 1.4)\n"
@@ -297,9 +299,22 @@ parse_args(int argc, char *argv[], Args *args)
 
 		case 'N': {
 			double v;
-			if (!parse_udouble(optarg, &v))
-				return bad_num('N');
-			args->nlm.sigma = v;
+			size_t n = strlen(optarg);
+			char num[64];
+
+			/* "5x": a factor on the estimate */
+			if (n > 1 && n < sizeof(num) && (optarg[n - 1] == 'x' || optarg[n - 1] == 'X')) {
+				memcpy(num, optarg, n - 1);
+				num[n - 1] = '\0';
+				if (!parse_udouble(num, &v) || v == 0.0)
+					return bad_num('N');
+				args->nlm.sigma = -1.0;
+				args->nlm.sigma_scale = v;
+			} else {
+				if (!parse_udouble(optarg, &v))
+					return bad_num('N');
+				args->nlm.sigma = v;
+			}
 			nlm_opt = 1;
 			break;
 		}

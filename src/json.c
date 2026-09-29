@@ -147,6 +147,8 @@ print_denoise_info(FILE *f, const DenoiseInfo *info, const unsigned int indent_l
 	fprintf(f, "%*s\"sigma\": ", indent_level + 2, "");
 	if (c->params.sigma >= 0.0)
 		fprintf(f, "%.4f,\n", c->params.sigma);
+	else if (c->params.sigma_scale != 1.0)
+		fprintf(f, "\"estimated x %.4f\",\n", c->params.sigma_scale);
 	else
 		fputs("\"estimated\",\n", f);
 	fprintf(f, "%*s\"sigma_used\": { \"mean\": %.4f, \"min\": %.4f, \"max\": %.4f }\n",

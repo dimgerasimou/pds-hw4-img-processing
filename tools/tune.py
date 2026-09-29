@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""
+tune.py - Find good NLM denoising settings for images with a known truth.
+
+imgfilter estimates the noise level of every image by itself. When the noise
+is spatially correlated, as in CT reconstructions, that estimate can be far
+too low and the filter then does almost nothing (2DeteCT: +0.03 dB with the
+defaults, about +8 dB with tuned settings). tune.py runs a grid of settings
+on a small sample of image pairs and prints the PSNR each one reaches, so
+that the best can be given to imgfilter, or to bench.py with --nlm "...".
+
+The settings (imgfilter options):
+  -N <sigma>  noise level in gray levels, or "5x" for 5 times the automatic
+              estimate (which follows the noise level of every image)
+  -H <k>      strength: the filter tolerates patch differences of about k * sigma
+  -P <r>      patch radius; larger patches suit correlated noise
+  -S <r>      search radius
+
+Pairs are given as for bench.py: --reference DIR holds the truth, files match
+by base name, or by --input-suffix / --reference-suffix, or through --pairs.
+A few dozen pairs are enough. The best PSNR can favor smoother images than
+the eye does, so look at the result, and check the chosen settings on other
+images (bench.py --nlm "..." with another --seed).
+
+Examples:
+  tools/tune.py --reference data/full data/low
+  tools/tune.py --reference data/full --sample 40 --sigma 4x,6x,8x --strength 0.8,1.2 data/low
+  tools/tune.py --reference data/full --gpu --patch 2,3,4,5 data/low
+"""
+
+import argparse
+import itertools
+import json
+import random
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+TOOLS = Path(__file__).resolve().parent
+REPO = TOOLS.parent
+sys.path.insert(0, str(TOOLS))
+sys.dont_write_bytecode = True
+
+try:
+    import numpy as np
+    import bench
+    import compare
+except ImportError as e:
+    sys.exit(f"tune.py: {e.name} is required (Arch: python-numpy python-pillow)")
+
+
+def str_list(s):
+    return [x for x in s.replace(" ", ",").split(",") if x]
+
+
+def int_list(s):
+    return [int(x) for x in str_list(s)]
+
+
+def mean_psnr(refs, outdir):
+    """Mean PSNR of the images in outdir against the references (dicts of arrays)."""
+    files = compare.images(outdir)
+    return float(np.mean([compare.psnr(refs[k].astype(float), bench.gray(files[k]).astype(float))
+                          for k in refs]))
+
+
+def denoise(args, opts, indir, outdir, bench_json=None):
+    cmd = [str(args.bin), "-d", *opts, "-B", "16"]
+    if args.gpu:
+        cmd.append("-g")
+    if bench_json:
+        cmd += ["-b", str(bench_json), "-n", "1"]
+    p = subprocess.run(cmd + ["-o", str(outdir), str(indir)], capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.exit(f"tune.py: imgfilter failed ({p.returncode}): {p.stderr.strip()[-300:]}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Find good NLM denoising settings for images with a known truth.",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("input", type=Path, help="directory of noisy images")
+    ap.add_argument("--reference", type=Path, required=True, help="directory with the truth")
+    ap.add_argument("--input-suffix", default="")
+    ap.add_argument("--reference-suffix", default="")
+    ap.add_argument("--pairs", type=Path, help='CSV of "input,reference" file names')
+    ap.add_argument("--sample", type=int, default=20, help="image pairs to use (default: 20)")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--sigma", type=str_list, default=["1x", "3x", "5x", "8x"],
+                    help='values of -N: numbers, or factors like 5x (default: 1x,3x,5x,8x)')
+    ap.add_argument("--strength", type=str_list, default=["0.4", "0.8", "1.2"],
+                    help="values of -H (default: 0.4,0.8,1.2)")
+    ap.add_argument("--patch", type=int_list, default=[2, 3, 4], help="values of -P (default: 2,3,4)")
+    ap.add_argument("--search", type=int_list, default=[10], help="values of -S (default: 10)")
+    ap.add_argument("--gpu", action="store_true", help="run imgfilter on the GPU (-g)")
+    ap.add_argument("--top", type=int, default=8, help="settings to list (default: 8)")
+    ap.add_argument("--bin", type=Path, default=REPO / "bin" / "imgfilter")
+    args = ap.parse_args()
+
+    if not args.bin.is_file():
+        sys.exit(f"tune.py: {args.bin} not found; run make first")
+    if not args.input.is_dir() or not args.reference.is_dir():
+        ap.error("the input and --reference must be directories")
+    if args.sample < 1:
+        ap.error("--sample must be at least 1")
+    if args.pairs and (args.input_suffix or args.reference_suffix):
+        ap.error("--pairs and the suffix options are alternatives")
+
+    pairs = bench.find_pairs(args)
+    if len(pairs) > args.sample:
+        pairs = sorted(random.Random(args.seed).sample(pairs, args.sample))
+
+    # the images as imgfilter reads them, so that bit depth and color match what it filters
+    work = REPO / "results" / f"tune_{random.Random().randrange(10 ** 8)}"
+    try:
+        work.mkdir(parents=True)
+        din, dref = bench.link_pairs(work, pairs)
+        args.nlm, args.canny, args.cold, args.trials, args.warmup = [], [], False, 1, 0
+        nin = compare.images(bench.normalize(args, work, din, "input"))
+        nref = compare.images(bench.normalize(args, work, dref, "reference"))
+        keys = sorted(k for k in nin if k in nref and bench.image_size(nin[k]) == bench.image_size(nref[k]))
+        if not keys:
+            sys.exit("tune.py: no pair of images of the same size")
+        refs = {k: bench.gray(nref[k]) for k in keys}
+        ins = {k: bench.gray(nin[k]) for k in keys}
+        indir = work / "norm" / "input"
+
+        noisy = float(np.mean([compare.psnr(refs[k].astype(float), ins[k].astype(float)) for k in keys]))
+        rms = float(np.mean([np.sqrt(np.mean((refs[k].astype(float) - ins[k].astype(float)) ** 2)) for k in keys]))
+        print(f"{len(keys)} image pairs; noisy input: {noisy:.2f} dB (RMS difference to the truth: {rms:.1f} gray levels)")
+
+        out = work / "out"
+        s0 = args.search[0]
+        shutil.rmtree(out, ignore_errors=True)
+        denoise(args, ["-S", str(s0)], indir, out, work / "auto.json")
+        auto = mean_psnr(refs, out)
+        est = json.load(open(work / "auto.json"))["denoise"]["sigma_used"]["mean"]
+        print(f"imgfilter's automatic setting: {auto:.2f} dB ({auto - noisy:+.2f}); it estimates the noise as "
+              f"{est:.1f} gray levels")
+
+        grid = list(itertools.product(args.sigma, args.strength, args.patch, args.search))
+        results = []
+        for n, (sg, h, p, s) in enumerate(grid, 1):
+            shutil.rmtree(out, ignore_errors=True)
+            denoise(args, ["-N", sg, "-H", h, "-P", str(p), "-S", str(s)], indir, out)
+            v = mean_psnr(refs, out)
+            results.append((v, sg, h, p, s))
+            print(f"[{n}/{len(grid)}] -N {sg} -H {h} -P {p} -S {s}: {v:.2f} dB", file=sys.stderr, flush=True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    results.sort(reverse=True)
+    print(f"\n{'':4s}{'-N':>8s}{'-H':>6s}{'-P':>4s}{'-S':>4s}{'PSNR dB':>10s}{'gain dB':>9s}")
+    for i, (v, sg, h, p, s) in enumerate(results[:args.top], 1):
+        print(f"{i:3d} {sg:>8s}{h:>6s}{p:>4d}{s:>4d}{v:>10.2f}{v - noisy:>+9.2f}")
+    v, sg, h, p, s = results[0]
+    print(f"\nbest: imgfilter -d -N {sg} -H {h} -P {p} -S {s} ...   "
+          f'bench.py --nlm "-N {sg} -H {h} -P {p} -S {s}" ...')
+    edge = []   # parameters whose best value is the largest one tried
+    for name, value, tried, key in (("--sigma", sg, args.sigma, lambda x: float(x.rstrip("xX"))),
+                                    ("--strength", h, args.strength, float),
+                                    ("--patch", p, args.patch, int)):
+        if len(set(tried)) > 1 and max(tried, key=key) == value:
+            edge.append(name)
+    if edge:
+        print(f"note: the best setting is the largest value tried for {', '.join(edge)}; "
+              "try larger values there and run again")
+
+if __name__ == "__main__":
+    main()

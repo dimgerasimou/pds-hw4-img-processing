@@ -345,7 +345,7 @@ nlm_job_prepare(const Image *src, const NlmParams *p, long band, int parallel,
 	if (!src->data || W == 0 || H == 0 || band <= 0)
 		return IMG_ERR_SIZE;
 
-	sigma = (p->sigma >= 0.0) ? p->sigma : nlm_noise_estimate(src, parallel);
+	sigma = (p->sigma >= 0.0) ? p->sigma : p->sigma_scale * nlm_noise_estimate(src, parallel);
 	if (sigma_out)
 		*sigma_out = sigma;
 
