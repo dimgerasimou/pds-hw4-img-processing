@@ -3,12 +3,17 @@
 bench.py - Benchmarks and quality evaluation for imgfilter.
 
 Steps (skip any with --skip):
-  data     the input directory as it is, or --sample N random images of it;
-           with noise (the default), clean PNG references and noisy copies
+  data     the input directory as it is, or --sample N random images of it.
+           Ground truth comes from one of two places:
+             synthetic  noise is added to the images (the default, --noise);
+                        the originals are the truth
+             real       --reference DIR holds the truth for the input images
+                        (e.g. normal-dose images for a low-dose input set);
+                        no noise is added
   batch    batch-size sweep on every device, all threads
   threads  thread sweep on the CPU, fixed batch size
-  quality  PSNR of noisy and denoised images against the clean ones, edge
-           accuracy against the edges of the clean images, and a check that
+  quality  PSNR of noisy and denoised images against the truth, edge
+           accuracy against the edges of the truth images, and a check that
            the CPU and GPU produce identical outputs
 
 Timed runs write no images unless --format is given, so that disk writes do
@@ -18,16 +23,28 @@ generated data/ and out/.
 
 Requires numpy and Pillow (Arch: python-numpy python-pillow).
 
+Pairing for --reference: files match by base name (scan01.png and
+scan01.tif are a pair). If the names differ only by a suffix, give it with
+--input-suffix and --reference-suffix (scan01_low.png, scan01_full.png); for
+anything else, --pairs FILE.csv lists "input,reference" per line, as paths
+relative to the two directories or absolute. Pairs must be registered and of
+the same size; pairs of different sizes are skipped and counted. Images that
+imgfilter cannot read (.npy arrays, for instance) can be converted to PNG with
+tools/convert.py, which applies one window to both sets.
+
 Examples:
   tools/bench.py --sample 200 data/chest_xray
   tools/bench.py --sample 200 --dose 0.2 --skip threads data/chest_xray
   tools/bench.py --noise none --filters edges --batches 16,64 data/chest_xray
+  tools/bench.py --reference data/normal_dose data/low_dose
+  tools/bench.py --reference data/full --input-suffix _low --reference-suffix _full data/low
 """
 
 import argparse
 import csv
 import datetime
 import json
+import math
 import os
 import platform
 import random
@@ -71,13 +88,86 @@ def default_threads():
 
 # ---------------------------------------------------------------- data
 
+def strip_suffix(stem, suffix):
+    return stem[:-len(suffix)] if suffix and stem.endswith(suffix) else stem
+
+
+def resolve(cell, base):
+    """A path from a --pairs file: relative to the directory, or absolute."""
+    for c in (base / cell, Path(cell)):
+        if c.is_file():
+            return c
+    return None
+
+
+def find_pairs(args):
+    """[(key, input file, reference file or None)], sorted by key."""
+    inputs = noise.list_inputs(args.input)
+    if not args.reference:
+        return [(f.stem, f, None) for f in sorted(inputs)]
+
+    refs = noise.list_inputs(args.reference)
+    pairs = {}
+    if args.pairs:
+        rows = [(n, r) for n, r in enumerate(csv.reader(open(args.pairs)), 1)
+                if r and not r[0].lstrip().startswith("#")]
+        if rows and rows[0][1][0].strip().lower() == "input":
+            rows = rows[1:]                                   # header
+        for n, r in rows:
+            if len(r) < 2:
+                sys.exit(f"bench.py: {args.pairs}: line {n}: expected input,reference")
+            a, b = resolve(r[0].strip(), args.input), resolve(r[1].strip(), args.reference)
+            if not a or not b:
+                sys.exit(f"bench.py: {args.pairs}: line {n}: cannot find {r[0] if not a else r[1]!r}")
+            key = a.stem
+            if key in pairs:
+                sys.exit(f"bench.py: {args.pairs}: {key!r} appears twice")
+            pairs[key] = (a, b)
+    else:
+        def keyed(files, suffix, what):
+            d = {}
+            for f in files:
+                k = strip_suffix(f.stem, suffix)
+                if k in d:
+                    sys.exit(f"bench.py: two {what} files map to {k!r}: {d[k].name}, {f.name}")
+                d[k] = f
+            return d
+        ins = keyed(inputs, args.input_suffix, "input")
+        rfs = keyed(refs, args.reference_suffix, "reference")
+        pairs = {k: (ins[k], rfs[k]) for k in ins.keys() & rfs.keys()}
+        lonely_in, lonely_ref = len(ins) - len(pairs), len(rfs) - len(pairs)
+        if lonely_in or lonely_ref:
+            log(f"data: {lonely_in} input and {lonely_ref} reference images have no partner, ignored")
+
+    if not pairs:
+        sys.exit("bench.py: no input image has a reference (names must match; see --input-suffix, "
+                 "--reference-suffix, --pairs)")
+    return [(k, a, b) for k, (a, b) in sorted(pairs.items())]
+
+
+def link_pairs(res, pairs):
+    """Symlinks the pairs under a common name into data/input and data/reference."""
+    din, dref = res / "data" / "input", res / "data" / "reference"
+    din.mkdir(parents=True)
+    dref.mkdir()
+    for key, a, b in pairs:
+        (din / (key + a.suffix)).symlink_to(a.resolve())
+        (dref / (key + b.suffix)).symlink_to(b.resolve())
+    return din, dref
+
+
 def prepare_data(args, res):
-    """Returns (input dir for the runs, clean reference dir or None)."""
-    files = noise.list_inputs(args.input)
+    """Returns (input dir for the runs, ground truth dir or None)."""
+    pairs = find_pairs(args)
     if args.sample:
-        if args.sample > len(files):
-            sys.exit(f"bench.py: --sample {args.sample}, but only {len(files)} images")
-        files = sorted(random.Random(args.seed).sample(files, args.sample))
+        if args.sample > len(pairs):
+            sys.exit(f"bench.py: --sample {args.sample}, but only {len(pairs)} images")
+        pairs = sorted(random.Random(args.seed).sample(pairs, args.sample))
+    files = [f for _, f, _ in pairs]
+
+    if args.reference:
+        log(f"data: {len(pairs)} pairs of real images")
+        return link_pairs(res, pairs)
 
     if args.noise == "none":
         if not args.sample:
@@ -221,6 +311,20 @@ def identical(a, b):
         Path(ia[k]).read_bytes() == Path(ib[k]).read_bytes() for k in ia)
 
 
+def normalize(args, res, src, name):
+    """The images as imgfilter reads them (8-bit gray), by running it without filters.
+
+    Truth and inputs both go through this, so that bit depth and color conversion
+    match what the filters saw; Pillow would clip 16-bit images instead of scaling.
+    """
+    d = res / "norm" / name
+    d.parent.mkdir(exist_ok=True)   # imgfilter creates only the last directory
+    code, err = imgfilter(args, ["-B", "16"], src, out=d, timed=False)
+    if code != 0:
+        sys.exit(f"bench.py: cannot read the {name} images ({code}): {err.strip()[-300:]}")
+    return d
+
+
 def quality(args, res, noisy, clean, gpu):
     out = res / "out"
     out.mkdir(exist_ok=True)
@@ -244,10 +348,24 @@ def quality(args, res, noisy, clean, gpu):
         if name == "denoised":
             sig = json.load(open(res / "runs" / f"quality_{name}.json"))["denoise"]["sigma_used"]
 
-    ref, nz, dn = load_dir(clean), load_dir(noisy), load_dir(out / "denoised")
+    log("[quality] reading the images")
+    ref = load_dir(normalize(args, res, clean, "reference"))
+    nz = load_dir(normalize(args, res, noisy, "input"))
+    dn = load_dir(out / "denoised")
     ec, en, ed = load_dir(out / "edges_clean"), load_dir(out / "edges_noisy"), load_dir(out / "edges_denoised")
+
+    keys = sorted(set(ref) & set(nz) & set(dn) & set(ec) & set(en) & set(ed))
+    odd = [k for k in keys if ref[k].shape != nz[k].shape]
+    if odd:
+        log(f"quality: {len(odd)} pairs skipped, input and reference differ in size: "
+            + ", ".join(odd[:5]) + (", ..." if len(odd) > 5 else ""))
+    keys = [k for k in keys if k not in odd]
+    skipped = len(ref) - len(keys)
+    if not keys:
+        sys.exit("bench.py: no image pair left for the quality step")
+
     rows = []
-    for k in sorted(ref):
+    for k in keys:
         rows.append({
             "image": k,
             "psnr_noisy": compare.psnr(ref[k].astype(float), nz[k].astype(float)),
@@ -256,14 +374,20 @@ def quality(args, res, noisy, clean, gpu):
             "edge_f1_denoised": edge_f1(ec[k], ed[k]),
         })
 
-    manifest = {r["file"].rsplit(".", 1)[0]: float(r["noise_std"])
-                for r in csv.DictReader(open(noisy / "noise.csv"))}
+    added = None
+    if (noisy / "noise.csv").exists():
+        manifest = {r["file"].rsplit(".", 1)[0]: float(r["noise_std"])
+                    for r in csv.DictReader(open(noisy / "noise.csv"))}
+        added = sum(manifest[k] for k in keys if k in manifest) / max(1, sum(k in manifest for k in keys))
     checks = {}
     if gpu:
         checks["denoise: CPU and GPU identical"] = identical(out / "denoised", out / "denoised_gpu")
         checks["denoise + edges: CPU and GPU identical"] = identical(out / "edges_denoised",
                                                                     out / "edges_denoised_gpu")
-    return rows, {"added": sum(manifest.values()) / len(manifest), "estimated": sig.get("mean")}, checks
+    shutil.rmtree(res / "norm", ignore_errors=True)
+    if args.drop_outputs:
+        shutil.rmtree(out, ignore_errors=True)
+    return rows, {"added": added, "estimated": sig.get("mean")}, checks, skipped
 
 
 # ---------------------------------------------------------------- report
@@ -285,7 +409,12 @@ def table(head, body):
     return "\n".join(lines + ["| " + " | ".join(str(c) for c in r) + " |" for r in body])
 
 
-def summary(batch_rows, thread_rows, qual, noise_lv, checks, filters):
+def finite_mean(values):
+    v = [x for x in values if math.isfinite(x)]
+    return sum(v) / len(v) if v else math.inf
+
+
+def summary(batch_rows, thread_rows, qual, noise_lv, checks, filters, skipped=0):
     md = []
     for filt in filters:
         b = [r for r in batch_rows if r["filter"] == filt]
@@ -333,9 +462,9 @@ def summary(batch_rows, thread_rows, qual, noise_lv, checks, filters):
                           f"**{serial['pipeline_s'] / g['pipeline_s']:.2f}x**\n")
     if qual:
         n = len(qual)
-        mean = lambda k: sum(r[k] for r in qual) / n
+        mean = lambda k: finite_mean([r[k] for r in qual])
         worst = lambda k: min(r[k] for r in qual)
-        md.append(f"## Quality ({n} images)\n")
+        md.append(f"## Quality ({n} images" + (f", {skipped} skipped: different sizes" if skipped else "") + ")\n")
         md.append(table(["", "noisy", "denoised"], [
             ["PSNR mean dB", f"{mean('psnr_noisy'):.2f}", f"{mean('psnr_denoised'):.2f}"],
             ["PSNR worst dB", f"{worst('psnr_noisy'):.2f}", f"{worst('psnr_denoised'):.2f}"],
@@ -345,15 +474,29 @@ def summary(batch_rows, thread_rows, qual, noise_lv, checks, filters):
         md.append("Edge F1: edges found on the noisy / denoised images against the edges of the "
                   "clean images, 1-pixel tolerance.\n")
         if noise_lv.get("estimated") is not None:
-            md.append(f"Noise level: added {noise_lv['added']:.2f}, estimated by imgfilter "
-                      f"{noise_lv['estimated']:.2f} (mean std, gray levels).\n")
+            if noise_lv.get("added") is not None:
+                md.append(f"Noise level: added {noise_lv['added']:.2f}, estimated by imgfilter "
+                          f"{noise_lv['estimated']:.2f} (mean std, gray levels).\n")
+            else:
+                md.append(f"Noise level estimated by imgfilter: {noise_lv['estimated']:.2f} "
+                          "(mean std, gray levels; real data, no added noise to compare with).\n")
         for k, v in checks.items():
             md.append(f"- {k}: **{'yes' if v else 'NO'}**")
         md.append("")
     return "\n".join(md)
 
 
-def environment(args, res, gpu):
+def describe_data(args, n):
+    if args.reference:
+        return (f"real pairs: {n} images of {args.input} with the truth in {args.reference}"
+                + (f" (sampled, seed {args.seed})" if args.sample else ""))
+    if args.noise == "none":
+        return f"{n} images of {args.input}, no ground truth"
+    return (f"{n} images of {args.input} with added {args.noise} noise (seed {args.seed}); "
+            "the originals are the truth")
+
+
+def environment(args, res, gpu, data):
     def cmd(c):
         try:
             return subprocess.run(c, capture_output=True, text=True, timeout=10).stdout.strip() or "unknown"
@@ -376,6 +519,7 @@ def environment(args, res, gpu):
         "gpu": cmd(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]) if gpu else "none",
         "commit": commit,
         "command": " ".join(sys.argv),
+        "data": data,
         "governor": gov, "cache": "cold" if args.cold else "warm",
         "OMP_PROC_BIND": os.environ["OMP_PROC_BIND"], "OMP_PLACES": os.environ["OMP_PLACES"],
         "nlm options": " ".join(args.nlm) or "defaults",
@@ -393,8 +537,14 @@ def main():
     ap.add_argument("input", type=Path, help="directory of images")
     ap.add_argument("--sample", type=int, help="use N random images of the input")
     ap.add_argument("--seed", type=int, default=0, help="for sampling and noise (default: 0)")
-    ap.add_argument("--noise", choices=("poisson", "gaussian", "none"), default="poisson",
-                    help="noise added to the images (default: poisson)")
+    ap.add_argument("--reference", type=Path,
+                    help="directory with the ground truth of the input images (real data: "
+                         "no noise is added)")
+    ap.add_argument("--input-suffix", default="", help="suffix of the input names that the reference names lack")
+    ap.add_argument("--reference-suffix", default="", help="suffix of the reference names that the input names lack")
+    ap.add_argument("--pairs", type=Path, help='CSV of "input,reference" file names, instead of matching names')
+    ap.add_argument("--noise", choices=("poisson", "gaussian", "none"), default=None,
+                    help="noise added to the images (default: poisson; none with --reference)")
     ap.add_argument("--dose", type=float, help="poisson: fixed dose (default: random per image)")
     ap.add_argument("--min-dose", type=float, default=0.10)
     ap.add_argument("--max-dose", type=float, default=0.50)
@@ -414,6 +564,8 @@ def main():
     ap.add_argument("--cold", action="store_true", help="drop the page cache before every timed run (sudo)")
     ap.add_argument("--skip", default="", help="steps to skip: " + ", ".join(STEPS))
     ap.add_argument("--bin", type=Path, default=REPO / "bin" / "imgfilter")
+    ap.add_argument("--drop-outputs", action="store_true",
+                    help="delete the denoised images of the quality step when done (they are large)")
     ap.add_argument("--no-build", action="store_true", help="do not run make first")
     ap.add_argument("--note", help="free text for environment.txt, e.g. the power profile")
     ap.add_argument("-o", "--results", type=Path, help="results directory (default: results/<timestamp>)")
@@ -430,6 +582,19 @@ def main():
         ap.error(f"unknown step in --skip (steps: {', '.join(STEPS)})")
     if not args.input.is_dir():
         ap.error(f"{args.input} is not a directory")
+    if args.reference:
+        if not args.reference.is_dir():
+            ap.error(f"{args.reference} is not a directory")
+        if args.noise not in (None, "none"):
+            ap.error("--reference gives real data with its own truth: no noise is added "
+                     "(drop --noise, or use --noise none)")
+        args.noise = "none"
+    else:
+        if args.input_suffix or args.reference_suffix or args.pairs:
+            ap.error("--input-suffix, --reference-suffix and --pairs need --reference")
+        args.noise = args.noise or "poisson"
+    if args.pairs and (args.input_suffix or args.reference_suffix):
+        ap.error("--pairs and the suffix options are alternatives")
     if args.cold:
         subprocess.run(["sudo", "-v"], check=True)
 
@@ -445,16 +610,24 @@ def main():
     res.mkdir(parents=True, exist_ok=False)
     (res / "runs").mkdir()
 
-    inp, clean = prepare_data(args, res) if "data" not in skip else (args.input, None)
+    if "data" not in skip:
+        try:
+            inp, clean = prepare_data(args, res)
+        except SystemExit:
+            shutil.rmtree(res, ignore_errors=True)   # nothing was measured yet
+            raise
+    else:
+        inp, clean = args.input, args.reference   # names must match already
+    data = describe_data(args, len(compare.images(inp)))
     gpu = "gpu" in devices and gpu_available(args, inp)
     if not gpu:
         devices = [d for d in devices if d != "gpu"]
-    environment(args, res, gpu)
+    environment(args, res, gpu, data)
 
     nmax = os.cpu_count() or 1
     nb = 0 if "batch" in skip else len(filters) * len(devices) * len(args.batches)
     nt = 0 if "threads" in skip else len(filters) * len(args.threads)
-    nq = 0 if "quality" in skip or clean is None else (6 if gpu else 4)
+    nq = 0 if "quality" in skip or clean is None else (6 if gpu else 4) + 2  # + reading the images
     per = f"{args.trials} trials" + ("" if args.cold or not args.warmup else f" + {args.warmup} warmup")
     log(f"plan: {nb} batch-sweep runs and {nt} thread-sweep runs ({per} each), {nq} quality runs")
 
@@ -467,16 +640,16 @@ def main():
                             [("cpu", f, t, args.thread_batch) for f in filters for t in args.threads])
     write_csv(res / "runs.csv", batch_rows + thread_rows)
 
-    qual, noise_lv, checks = [], {}, {}
+    qual, noise_lv, checks, skipped = [], {}, {}, 0
     if "quality" not in skip:
         if clean is None:
-            log("quality: skipped, needs noise added to the images (no clean reference)")
+            log("quality: skipped, needs a ground truth (noise added to the images, or --reference)")
         else:
-            qual, noise_lv, checks = quality(args, res, inp, clean, gpu)
+            qual, noise_lv, checks, skipped = quality(args, res, inp, clean, gpu)
             write_csv(res / "quality.csv", qual)
 
-    md = summary(batch_rows, thread_rows, qual, noise_lv, checks, filters)
-    (res / "summary.md").write_text(f"# imgfilter benchmark, {res.name}\n\n{md}")
+    md = summary(batch_rows, thread_rows, qual, noise_lv, checks, filters, skipped)
+    (res / "summary.md").write_text(f"# imgfilter benchmark, {res.name}\n\nData: {data}\n\n{md}")
     print(md)
     log(f"results in {res}")
 
