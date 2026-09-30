@@ -1,8 +1,8 @@
-#!/bin/sh
+#!/bin/bash
 
 set -euo pipefail
 
-python -c "import numpy; import PIL; print('numpy:', numpy.__version__); print('Pillow:', PIL.__version__)" &> /dev/null || (echo "numpy and pillow need to be installed" && exit 1)
+python3 -c "import numpy; import PIL; print('numpy:', numpy.__version__); print('Pillow:', PIL.__version__)" &> /dev/null || (echo "numpy and pillow need to be installed" && exit 1)
 wget --version &> /dev/null || (echo "wget needs to be installed" && exit 1)
 
 mkdir -p 2detect-tmp

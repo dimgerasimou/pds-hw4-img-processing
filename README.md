@@ -90,7 +90,7 @@ tools/bench.py --reference data/aapm/reference --skip batch,threads data/aapm/in
 tools/bench.py --reference data/2detect/reference --sample 500 data/2detect/input
 
 # images without a ground truth: noise is added to the originals
-tools/bench.py --sample 500 data/chest_xray
+tools/bench.py --sample 500 data/chest-xray/reference
 ```
 
 Useful options are `--devices cpu,gpu`, `--batches`, `--threads`, `-n` and `-w` for the trials, `--nlm "-S 7 -H 1.0"` to pass options to the denoiser, and `--keep-outputs` to keep the processed images.
@@ -101,7 +101,7 @@ The results directory holds `summary.md` (tables), `runs.csv` and `quality.csv` 
 
 `tools/convert.py` turns CT data (`.npy` or `.tif`) into the 8-bit PNG pairs the tools expect, with one fixed window for both images of a pair. `tools/noise.py` writes noisy copies of a directory of images.
 
-In the folder `scripts`, you can run from the project directory shell scripts that automatically download and compile datasets for you.
+In the folder `scripts`, you can run from the project directory shell scripts that automatically download and convert the datasets for you. They need `wget` and `unzip` (and `7z` for AAPM).
 
 ## Performance Results
 

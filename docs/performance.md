@@ -7,7 +7,7 @@ This report summarizes the benchmark runs produced by the current implementation
 - **CPU**: 11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz (8 cores, 16 threads)
 - **RAM**: 15.3 GiB
 - **GPU**: NVIDIA GeForce RTX 3060 Laptop GPU (Compute Capability 8.6, 30 SMs, 5.7 GiB)
-- **CUDA driver / runtime**: 13040 / 13040
+- **CUDA driver / runtime**: 13.4 / 13.4
 - **Governor**: performance; threads bound with `OMP_PROC_BIND=close`, `OMP_PLACES=cores`
 - **Commit**: 5be7a85
 
@@ -444,15 +444,15 @@ The CPU denoising scales 6.5× on 16 threads (6.4× on 8): the machine has 8 phy
 - The GPU is fastest with batches of 4–16 images for denoising and of 64 for edge detection. A batch of 256 makes denoising 8–13% slower and needs 3–6 times the memory of a batch of 16; the CPU denoising time hardly depends on the batch size above 16.
 - Denoising raises the PSNR by 4.5 to 9.2 dB on average, and only 4 of the 36,669 images get worse (by at most 1.6 dB). The noise added to the chest X-rays is estimated to within 5%.
 - The edge F1 rises on every dataset: from 0.69–0.74 to 0.80 on the chest X-rays, from 0.82 to 0.85 on AAPM, and from 0.25 to 0.75 on 2DeteCT. Where the noisy image is already reliable, denoising can lower it: on the cleanest quarter of the AAPM slices (−0.014) and of the mixed chest X-rays (35% of the images).
-- The 500-image samples represent the full datasets to within 0.13 dB and 0.003 edge F1.
+- The 500-image samples represent the full datasets to within 0.14 dB and 0.004 edge F1.
 - The CPU and GPU outputs are byte-identical in all eight runs, for denoising and for denoising with edges.
 
 ## Runs
 
 | Run                       | Dataset                 | Kind                                | Images | Duration (min) |
 | ------------------------- | ----------------------- | ----------------------------------- | -----: | -------------: |
-| chest-xrau-pneumonia-full | Chest X-ray (pneumonia) | quality, all images                 |  5,856 |           46.0 |
-| chest-xrau-pneumonia-500  | Chest X-ray (pneumonia) | speed and quality, 500-image sample |    500 |          125.3 |
+| chest-xray-pneumonia-full | Chest X-ray (pneumonia) | quality, all images                 |  5,856 |           46.0 |
+| chest-xray-pneumonia-500   | Chest X-ray (pneumonia) | speed and quality, 500-image sample |    500 |          125.3 |
 | chest-xray-full           | Chest X-ray (mixed)     | quality, all images                 | 25,553 |          104.4 |
 | chest-xray-500            | Chest X-ray (mixed)     | speed and quality, 500-image sample |    500 |           60.2 |
 | aapm-full                 | AAPM Low-Dose CT        | quality, all images                 |  4,260 |            6.0 |

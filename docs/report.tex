@@ -90,23 +90,23 @@ The PSNR rises by 4.5--9.2\,dB on average, and the edge F1 score on 2DeteCT from
 
 \section{Introduction}
 X-ray and CT images are noisy, and the noise breaks the edge detection that often follows. Non-Local Means \cite{buades05,buades11} removes
-it by averaging every pixel with all pixels whose surroundings look alike, which preserves structure but the direct method costs
+it by averaging every pixel with all pixels whose surroundings look alike, which preserves structure, but the direct method costs
 $(2S{+}1)^2(2P{+}1)^2\approx\num{11025}$ operations per pixel with the usual $21\times21$ search window and $5\times5$ patches: about
 $10^{14}$ operations for the \num{8.3} gigapixels of one of our datasets. This work parallelizes the pipeline (read, decode, denoise, detect
 edges, encode, write) for batches of images on the CPU and the GPU, and measures its speed and the quality of its output.
 
 \section{Algorithms}
 \textbf{Non-Local Means} Every output pixel is the weighted mean of the pixels in its search window. The weight of a candidate falls
-exponentially with the squared distance between the two patches, $w=e^{\frac{-\max(d^2 - 2\sigma^2, 0)}{h^2}}$ with $h=k\sigma$ \cite{buades11}.
+exponentially with the squared distance between the two patches, $w=e^{\frac{-\max(d^2 - 2\sigma^2, 0)}{h^2}}$ with $h=k\sigma$ \cite{buades11}, where $d^2$ is the mean squared difference of the two patches.
 For a fixed search offset, the squared differences of all pixels form an image, and its \emph{integral image} (summed-area table
-\cite{crow84,darbon08}) gives every patch sum with four lookups, which removes the patch size from the cost. All sums are exact 32-bit
-integers, so the result does not depend on the thread count and is the same on the GPU. \textbf{Noise level and strength.} $\sigma$ is
+\cite{crow84,darbon08}) gives every patch sum with four lookups, which removes the patch size from the cost. Patch sums are exact 32-bit
+integers (the integral images wrap around modulo $2^{32}$, which leaves their differences exact), so the result does not depend on the thread count and is the same on the GPU. \textbf{Noise level and strength.} $\sigma$ is
 estimated per image as the larger of Immerk{\ae}r's estimate \cite{immerkaer96}, exact for white noise but too low for the correlated
 noise of CT reconstructions, and the noise of the flattest $16\times16$ blocks. The strength $k=\frac{h}{\sigma}$ rises from 0.7 (white noise)
 to 1.6 (strongly correlated noise) with the ratio of the two estimates. When edge detection follows, it is 0.7 times that for near-white
 noise, since the edge score peaks at a milder strength than the PSNR.
 
-\textbf{Canny} \cite{canny86}: Configured using Gaussian blur ($\sigma=1.4$), Sobel gradient, non-maximum suppression and hysteresis (thresholds 20 and
+\textbf{Canny} \cite{canny86}: Gaussian blur ($\sigma=1.4$), Sobel gradient, non-maximum suppression and hysteresis (thresholds 20 and
 50), all in integer arithmetic (fixed-point weights, squared magnitudes), so that both backends agree exactly.
 
 \textbf{Quality} is measured by the PSNR against the ground truth, and by the \emph{edge F1}: the Canny edges of the noisy (or denoised)
@@ -125,9 +125,9 @@ image keeps every thread busy. This is the only CPU scheduling. Canny uses the s
 
 \begin{itemize}
 	\item \textbf{Cache} For one search offset the integral image has one 4-byte entry per pixel: 4\,MB for a 1\,Mpx slice,
-	      rebuilt for each of the 441 offsets. For a band, the integral images of the 4 offsets processed together
-	      and the three accumulators per pixel (weight sum, weighted sum, largest weight, 0.4\,MB) stay in the core's L2 cache
-	      (1.25\,MB) during all 441 offsets, so the offset loop runs from cache, not from memory.
+	      rebuilt for each of the 441 offsets. For a band of 32 rows of a 1024-pixel-wide image, the integral images of the 4 offsets processed together
+	      (0.6\,MB) and the three accumulators per pixel (weight sum, weighted sum, largest weight; 0.4\,MB) take about 1\,MB, which fits
+	      the core's L2 cache (1.25\,MB). The scratch of a thread grows with the image width (about 3\,MB for the widest X-rays) but not with its height.
 	\item \textbf{Load balance} Our images range from $144\times124$ to $2916\times2863$ pixels. With one image per thread
 	      every batch waits for its largest image (97.2\% of the threads busy on the X-ray set). With small equal-cost bands
 	      the idle time at the end of a batch is at most one band (99.9\% busy, 15.99 of 16 threads).
@@ -200,16 +200,17 @@ and the complete datasets are also timed end to end (batches of 16, output writt
 
 \begin{itemize}
 	\item \textbf{Chest X-ray (pneumonia)}: the \num{5856} pediatric radiographs of the Kaggle pneumonia set
-	      \cite{kermany18}. Poisson noise is added to the originals, which are the ground truth.
+	      \cite{kermany18}. Poisson noise (dose drawn per image from 10--50\%, seed 0) is added to the originals, which are the ground truth.
 	\item \textbf{Chest X-ray (mixed)}: \num{25553} radiographs of mixed origin (\num{10641} tuberculosis,
-	      \num{9088} normal, \num{5824} pneumonia cases), $144\times124$ to $2916\times2863$ pixels. Poisson
-	      noise is added as the previous.
-	\item \textbf{AAPM Low-Dose CT}: \num{4260} slices of $512\times512$ \cite{mccollough17}. The quarter-dose
+	      \num{9088} normal, \num{5824} pneumonia cases), $144\times124$ to $2916\times2863$ pixels (Kaggle
+	      \cite{kagglecxr}). Poisson noise is added as for the previous set.
+	\item \textbf{AAPM Low-Dose CT}: \num{4260} slices of $512\times512$ \cite{mccollough17}, from a community \texttt{.npy} mirror. The quarter-dose
 	      slice is the input, the full-dose slice the truth.
 	\item \textbf{2DeteCT}: \num{1000} slices of $1024\times1024$ \cite{kiss23}. The mode-1 (low dose)
 	      reconstruction is the input and the mode-2 (high fidelity) reconstruction the truth. The noise of
 	      both is real or simulated on the projections, and spatially correlated.
 \end{itemize}
+The CT slices are mapped to 8 bits with one window per dataset, from 0 to the 99.5th percentile of the reference images, so the PSNR values are relative to that window.
 
 \section{Results}
 \subsection{Speed}
@@ -247,7 +248,7 @@ compromise.
 		2DeteCT & 524 & 490.2 & 75.0 & 3.52 & 6.5$\times$ & 21.3$\times$ & 139$\times$ & 18.58 & 2.27 & 0.400 & 5.7$\times$ \\
 		\bottomrule
 	\end{tabular}
-	\caption{Speed on 500 image samples (best batch size of each run, median of 3 trials).}
+	\caption{Speed on 500-image samples (best batch size of each run, median of 3 trials).}
 	\label{tab:speed}
 \end{table*}
 
@@ -327,16 +328,16 @@ compromise.
 			\end{axis}
 		\end{tikzpicture}
 	\end{minipage}
-	\caption{Effect of the batch size (500-image sweeps). (a) Time relative to the best batch size of each configuration, mean of the four datasets. CPU with 16 threads. (b) Peak resident memory of the GPU denoising run, per dataset.}
+	\caption{Effect of the batch size (500-image sweeps). (a) Time relative to the best batch size of each configuration, mean of the four datasets, the CPU with 16 threads. (b) Peak resident memory of the GPU denoising run, per dataset.}
 	\label{fig:batch}
 \end{figure*}
 
 \subsection{Complete Datasets}
 Table~\ref{tab:full} gives the end-to-end times of the runs on every image of each dataset: read, decode, filter, encode and write the
-result, with 16 threads, batches of 16 and one trial. The GPU is 20--22$\times$ faster than the CPU here as well (17.6--21.5$\times$ when edges follow),
+result, with 16 threads, batches of 16 and one trial. The GPU is 20--22$\times$ faster than the CPU here as well (16.6--20.5$\times$ when edges follow),
 although every result image is encoded and written: the batch pipeline hides this CPU-side work behind the kernels, and the whole run reaches
 142--150\,Mpx/s, as in the 500-image sweeps. The CPU needs 20 minutes for the pneumonia set and 44 minutes for the mixed set, the GPU 58 and 130 seconds.
-Edge detection after the denoising adds 7--8\% on the CPU and 8--10\% on the GPU, and 21\% on the small AAPM slices, where decoding dominates.
+Edge detection after the denoising adds 1--3\% on the CPU and 8--10\% on the GPU, and 21\% on the small AAPM slices, where decoding dominates.
 
 \begin{table*}[ht]
 	\centering\footnotesize
@@ -348,10 +349,10 @@ Edge detection after the denoising adds 7--8\% on the CPU and 8--10\% on the GPU
 		\cmidrule(lr){4-7}\cmidrule(lr){8-11}
 		\textbf{Dataset} & \textbf{Images} & \textbf{Mpx} & CPU & GPU & Speedup & GPU Mpx/s & CPU & GPU & Speedup & GPU Mpx/s\\
 		\midrule
-		Chest X-ray (pneumonia) & 5\,856 & 8\,309 & 1\,186.1 & 57.7 & 20.5$\times$ & 144 & 1\,272.4 & 62.4 & 20.4$\times$ & 133 \\
-		Chest X-ray (mixed) & 25\,553 & 18\,486 & 2\,635.2 & 130.0 & 20.3$\times$ & 142 & 2\,835.0 & 143.1 & 19.8$\times$ & 129 \\
-		AAPM Low-Dose CT & 4\,260 & 1\,117 & 153.2 & 7.7 & 20.0$\times$ & 145 & 164.0 & 9.3 & 17.6$\times$ & 120 \\
-		2DeteCT & 1\,000 & 1\,049 & 151.9 & 7.0 & 21.7$\times$ & 150 & 163.6 & 7.6 & 21.5$\times$ & 138 \\
+		Chest X-ray (pneumonia) & 5\,856 & 8\,309 & 1\,186.1 & 57.7 & 20.5$\times$ & 144 & 1\,210.0 & 62.4 & 19.4$\times$ & 133 \\
+		Chest X-ray (mixed) & 25\,553 & 18\,486 & 2\,635.2 & 130.0 & 20.3$\times$ & 142 & 2\,691.8 & 143.1 & 18.8$\times$ & 129 \\
+		AAPM Low-Dose CT & 4\,260 & 1\,117 & 153.2 & 7.7 & 20.0$\times$ & 145 & 154.7 & 9.3 & 16.6$\times$ & 120 \\
+		2DeteCT & 1\,000 & 1\,049 & 151.9 & 7.0 & 21.7$\times$ & 150 & 156.0 & 7.6 & 20.5$\times$ & 138 \\
 		\bottomrule
 	\end{tabular}
 	\caption{End-to-end times on the complete datasets (16 threads, batches of 16, output written, one trial).}
@@ -369,7 +370,7 @@ already reliable, denoising can lower the score. In the cleanest quarter of the 
 and in the cleanest quarter of the mixed chest X-rays 35\% of the images end with a lower edge score than the noisy input.
 This is the price of a strength that favours the PSNR. The worst AAPM slice (18.2\,dB) gains only 0.2\,dB. Structured
 artifacts are not noise and a denoiser cannot repair them. The 500-image samples agree with the full sets to within
-0.13\,dB and 0.003 F1.
+0.14\,dB and 0.004 F1.
 
 \begin{table*}[ht]
 	\centering\footnotesize
@@ -413,8 +414,9 @@ artifacts are not noise and a denoiser cannot repair them. The 500-image samples
 	      only 2.9--5.7$\times$. The copies that are 2\% of the NLM GPU time were 27--42\% of the Canny GPU time before the streams.
 	\item \textbf{Efficiency is bounded by the hardware}: 80\% on 8 cores and 40\% on 16 threads. NLM already keeps each core
 	      busy, so hyperthreading adds nothing, unlike the memory-bound edge detection (14--22\%).
-	\item \textbf{Exactness} made every step testable: the CPU, the GPU and an independent NumPy implementation agree bit for bit,
-	      so each optimization was checked for identical output.
+	\item \textbf{Exactness} made every step testable: the CPU and the GPU agree bit for bit, so each optimization was checked for identical output.
+	      An independent float64 NumPy implementation of the same algorithm matches to within one gray level, apart from rare outlier
+	      pixels whose candidates all have weights below $e^{-30}$, which the code skips.
 \end{itemize}
 
 \section{Conclusions}
@@ -428,7 +430,7 @@ F1 on real CT noise from 0.25 to 0.75.
 hysteresis iteration. Choose the strength per image for the edge score, since the cleanest slices lose a little. Symmetric weights
 with a tolerance based reference. Multi-GPU batches.
 
-\noindent\textbf{Code Availability:} Source code, benchmark scripts and all results are available at:\\
+\noindent\textbf{Code Availability:} Source code, benchmark scripts and the benchmark results (\texttt{docs/performance.md}) are available at:\\
 \url{https://github.com/dimgerasimou/pds-hw4-img-processing}.
 
 \begin{multicols}{2}
@@ -442,6 +444,7 @@ with a tolerance based reference. Multi-GPU batches.
 \bibitem{mahmoudi05} M. Mahmoudi, G. Sapiro, Fast image and video denoising via nonlocal means of similar neighborhoods, \emph{IEEE Signal Processing Letters} 12(12), 2005.
 \bibitem{coupe08} P. Coup\'e et al., An optimized blockwise nonlocal means denoising filter for 3-D MR images, \emph{IEEE TMI} 27(4), 2008.
 \bibitem{kermany18} D. S. Kermany et al., Identifying medical diagnoses and treatable diseases by image-based deep learning, \emph{Cell} 172(5), 2018.
+\bibitem{kagglecxr} Kaggle dataset \texttt{muhammadrehan00/chest-xray-dataset}, \url{https://www.kaggle.com/datasets/muhammadrehan00/chest-xray-dataset}.
 \bibitem{mccollough17} C. H. McCollough et al., Low-dose CT for the detection and classification of metastatic liver lesions: results of the 2016 Low Dose CT Grand Challenge, \emph{Medical Physics} 44(10), 2017.
 \bibitem{kiss23} M. B. Kiss et al., 2DeteCT -- a large 2D expandable, trainable, experimental computed tomography dataset for machine learning, \emph{Scientific Data} 10, 2023.
 \end{thebibliography}
