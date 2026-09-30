@@ -179,7 +179,7 @@ main(int argc, char *argv[])
 			.search   = DEFAULT_NLM_SEARCH,
 			.h_factor = DEFAULT_NLM_H,
 			.sigma    = DEFAULT_NLM_SIGMA,
-			.sigma_scale = 1.0,
+			.strength_scale = 1.0,
 		},
 	};
 

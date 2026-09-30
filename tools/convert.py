@@ -2,38 +2,30 @@
 """
 convert.py - Convert .npy and .tif images to 8-bit PNG with one fixed window.
 
-imgfilter reads 8-bit images, but CT data comes as float or integer arrays
-in scanner units. Each value v becomes round(255 * (v - LO) / (HI - LO)),
-clipped to 0..255, with the same LO and HI for every image of both sets.
-Scaling each image by its own minimum and maximum would give a noisy image
-and its clean counterpart different gray levels, and PSNR would then measure
-that difference instead of the denoising.
+imgfilter reads 8-bit images, but CT data comes as float or integer arrays. Each
+value v becomes round(255 * (v - LO) / (HI - LO)), clipped to 0..255, with the
+same LO and HI for every image of both sets: scaling each image by its own
+minimum and maximum would give a noisy image and its clean counterpart different
+gray levels, and PSNR would measure that instead of the denoising.
 
-Three layouts:
-  ROOT has subdirectories fd/ and qd/ (the AAPM Low-Dose CT mirror: full
-  dose and quarter dose, files 1.npy, 2.npy, ... in both): the pairs are
-  written to OUTPUT/reference and OUTPUT/input, under the same names.
-  ROOT has one subdirectory per image, and --reference-file and --input-file
-  give the paths of the two files inside each (2DeteCT: slice00001/mode2/
-  reconstruction.tif and slice00001/mode1/reconstruction.tif): written to
-  OUTPUT/reference and OUTPUT/input as slice00001.png, and so on.
-  ROOT holds image files: they are written to OUTPUT.
+Layouts:
+  ROOT/fd and ROOT/qd (AAPM mirror: full and quarter dose, same file names):
+      written to OUTPUT/reference and OUTPUT/input
+  ROOT/<name>/ per image, with --reference-file and --input-file naming the two
+  files inside (2DeteCT: mode2/reconstruction.tif, mode1/reconstruction.tif):
+      written to OUTPUT/reference and OUTPUT/input as <name>.png
+  ROOT with image files: written to OUTPUT
 
-The window is given with --window LO HI (in the units of the data), or taken
-from percentiles of the reference set (--percentiles, default 0.5 99.5) and
-applied to both. Use --info to see the value ranges without writing anything.
-Clipping removes noise at the edges of the window, so for CT a soft-tissue
-window such as -160 240 (HU) is usually a better choice than the percentiles.
-
-Requires numpy and Pillow (Arch: python-numpy python-pillow).
+The window is --window LO HI in the units of the data, or the percentiles
+(--percentiles, default 0.5 99.5) of the reference set, applied to both.
+--info prints the value ranges and stops. Clipping removes noise at the window's
+edges, so a soft-tissue window such as -160 240 (HU) usually beats the percentiles.
 
 Examples:
   tools/convert.py --info aapm/data/test
-  tools/convert.py aapm/data/test aapm_png
-  tools/convert.py --window -160 240 --limit 50 aapm/data/test aapm_png
+  tools/convert.py --window -160 240 aapm/data/test aapm_png
   tools/convert.py --reference-file mode2/reconstruction.tif \\
       --input-file mode1/reconstruction.tif --limit 200 2detect 2detect_png
-  tools/bench.py --reference aapm_png/reference --skip batch,threads aapm_png/input
 """
 
 import argparse
@@ -116,7 +108,7 @@ def convert(items, out, lo, hi):
 def main():
     ap = argparse.ArgumentParser(
         description="Convert .npy and .tif images to 8-bit PNG with one fixed window.",
-        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("Three layouts:")[1])
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("Layouts:")[1])
     ap.add_argument("input", type=Path, help="directory with fd/ and qd/, with one subdirectory "
                                              "per image, or with image files")
     ap.add_argument("output", type=Path, nargs="?", help="output directory (must not exist)")

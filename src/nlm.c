@@ -297,22 +297,17 @@ immerkaer(const Image *img, int parallel)
 
 #define FLAT_B          16     /* block side */
 #define FLAT_QUANTILE   0.10   /* quantile of the block variances that gives sigma */
-#define FLAT_WEIGHT     0.9    /* flat estimates count for this much against Immerkaer's */
-#define FLAT_MIN        5.0    /* weighted flat estimates below this are ignored: the fine texture
-                                  and detector noise of an image itself (3 to 4 gray levels in
-                                  radiographs) cannot be told from mild correlated noise */
+#define FLAT_WEIGHT     0.9    /* against Immerkaer's estimate, so that white noise keeps that one */
+#define FLAT_MIN        5.0    /* below this, noise cannot be told from the image's own texture */
 
 /*
- * h / sigma by excess, the ratio of the two noise estimates: linear between
- * the points. Measured as the strength with the best PSNR: about 0.6 to 0.8
- * for white Gaussian noise (0.8 for Poisson), 1.2 for the noise of filtered
- * back-projection, and 1.6 for the correlated noise of a CT reconstruction
- * (2DeteCT), which has an excess of 5.
+ * h / sigma by the excess of the flat-block estimate over Immerkaer's, linear
+ * between the points. The strengths with the best PSNR: white 0.7, filtered
+ * back-projection 1.2, 2DeteCT (excess 5) 1.6.
  */
 static const double strength_by_excess[][2] = {
 	{ 1.05, 0.7 }, { 1.25, 1.2 }, { 1.50, 1.2 }, { 3.00, 1.6 },
 };
-#define STRENGTH_DEFAULT  0.7   /* for an explicit -N without -H: what white noise gets */
 
 static int
 cmp_double(const void *a, const void *b)
@@ -323,10 +318,9 @@ cmp_double(const void *a, const void *b)
 }
 
 /*
- * Standard deviation of the noise in the flattest blocks: the FLAT_QUANTILE
- * quantile of the variances left after a plane fit. Blocks that are constant
- * or clipped (more than 5% of the pixels at 0 or 255) are left out.
- * Returns 0 if fewer than 8 blocks remain.
+ * Noise of the flattest blocks: the FLAT_QUANTILE quantile of the variances
+ * left by a plane fit, over blocks that are neither constant nor clipped.
+ * Sees noise of any correlation, unlike Immerkaer's. 0 if fewer than 8 blocks remain.
  */
 static int
 flat_noise(const Image *img, int parallel, double *sigma)
@@ -365,9 +359,9 @@ flat_noise(const Image *img, int parallel, double *sigma)
 		double tot = szz - n * mean * mean;
 
 		if (tot / n < 0.0025 || clipped * 20 > B * B)
-			var[k] = -1.0;                                  /* constant or clipped */
+			var[k] = -1.0;
 		else
-			var[k] = (tot - (bx * bx + by * by) * sxx) / (n - 3.0);   /* plane removed */
+			var[k] = (tot - (bx * bx + by * by) * sxx) / (n - 3.0);
 	}
 
 	for (long k = 0; k < nb; k++)
@@ -389,23 +383,33 @@ flat_noise(const Image *img, int parallel, double *sigma)
 	return 0;
 }
 
-NlmNoise
-nlm_noise_estimate(const Image *img, int parallel)
+/* The noise level, and the excess of the flat-block estimate over Immerkaer's (1 if unused). */
+static double
+noise_estimate(const Image *img, int parallel, double *excess)
 {
-	NlmNoise n = { immerkaer(img, parallel), 1.0 };
-	double sigma;
+	double sigma = immerkaer(img, parallel), flat;
 
-	if (flat_noise(img, parallel, &sigma) && FLAT_WEIGHT * sigma >= FLAT_MIN) {
-		sigma *= FLAT_WEIGHT;
-		if (n.sigma > 0.0)
-			n.excess = sigma / n.sigma;
-		if (sigma > n.sigma)
-			n.sigma = sigma;
+	*excess = 1.0;
+	if (flat_noise(img, parallel, &flat) && FLAT_WEIGHT * flat >= FLAT_MIN) {
+		flat *= FLAT_WEIGHT;
+		if (sigma > 0.0)
+			*excess = flat / sigma;
+		if (flat > sigma)
+			sigma = flat;
 	}
-	return n;
+	return sigma;
 }
 
-/* h / sigma for an image whose two noise estimates differ by @p excess. */
+/* The edge scale holds up to excess 1.25 and fades out by 2: correlated noise needs the full strength. */
+static double
+edge_scale(double scale, double excess)
+{
+	double t = (excess - 1.25) / 0.75;
+
+	t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+	return scale + (1.0 - scale) * t;
+}
+
 static double
 auto_strength(double excess)
 {
@@ -466,24 +470,19 @@ nlm_job_prepare(const Image *src, const NlmParams *p, long band, int parallel,
 	const long H = (long)src->height;
 	const double area = (double)(2 * p->patch + 1) * (double)(2 * p->patch + 1);
 	NlmContext *c = &job->ctx;
-	double sigma, strength = p->h_factor, h, cut;
+	double sigma, excess = 1.0, strength = p->h_factor, h, cut;
 
 	memset(job, 0, sizeof(*job));
 
 	if (!src->data || W == 0 || H == 0 || band <= 0)
 		return IMG_ERR_SIZE;
 
-	if (p->sigma >= 0.0) {
+	if (p->sigma >= 0.0)
 		sigma = p->sigma;
-	} else {
-		NlmNoise noise = nlm_noise_estimate(src, parallel);
-
-		sigma = p->sigma_scale * noise.sigma;
-		if (strength <= 0.0)
-			strength = auto_strength(noise.excess);
-	}
+	else
+		sigma = noise_estimate(src, parallel, &excess);
 	if (strength <= 0.0)
-		strength = STRENGTH_DEFAULT;
+		strength = edge_scale(p->strength_scale, excess) * auto_strength(excess);
 	if (sigma_out)
 		*sigma_out = sigma;
 	if (strength_out)
