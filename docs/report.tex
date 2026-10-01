@@ -82,7 +82,7 @@
 For this assignment, we present a batch tool that denoises grayscale images with \emph{Non-Local Means} (NLM) and extracts their edges
 with the \emph{Canny} detector, on multicore CPUs (\textbf{OpenMP}) and on NVIDIA GPUs (\textbf{CUDA}).
 The noise level and the filter strength are estimated for every image, and the CPU and the GPU produce identical \textbf{deterministic} output.
-The main techniques are integral images for the patch distances, row \textbf{bands} sized for the L2 cache and drawn from one shared pool
+The main techniques are integral images for the patch distances, row \textbf{bands} of 16--32 rows drawn from one shared pool
 on the CPU, and a shared-memory tile kernel with a register sliding window, a batch pipeline and a two-slot CUDA stream driver on the GPU.
 On an Intel i7-11800H and an RTX~3060 Laptop GPU, tested on \num{36669} images of four datasets (two chest X-ray collections with added
 Poisson noise, AAPM low-dose CT, and the real noise of 2DeteCT), denoising runs at 1.1\,Mpx/s on one thread, \mbox{7.0--7.3\,Mpx/s} on 16
@@ -172,8 +172,8 @@ on clean images).
 		GPU kernel restructuring v1$\to$v4: no integer division, 32-row tiles with 2 pixels per thread, dense element mapping, register window, 4 offsets per barrier, template over $P$ & 3.2$\times$\\
 		Bands and fast interior path for Canny (CPU) & 3.0$\times$, threads busy 9.7 $\to$ 15.6\\
 		Table-free weights on the GPU (no table gathers) & 1.49$\times$\\
-		Offset blocking on the CPU: 4 offsets per pass, independent running sums & 1.14$\times$ at 16 threads, 1.17--1.48$\times$ at 1\\
 		Batch pipeline with the GPU (batches of 16 instead of one batch) & 1.24$\times$\\
+		Offset blocking on the CPU: 4 offsets per pass, independent running sums & 1.14$\times$ at 16 threads, 1.17--1.48$\times$ at 1\\
 		Chunked rejection: branch-free sums, 16 pixels skipped at once & 1.10--1.18$\times$\\
 		Active tiles in the GPU hysteresis & hysteresis $-$28\%\\
 		Explicit \texttt{fmaf} in the weight polynomial; conflict-free tile pitch with one 16-byte store & 1.06$\times$; 1.04$\times$\\
@@ -411,8 +411,8 @@ artifacts are not noise and a denoiser cannot repair them. The 500-image samples
 \section{Analysis and Discussion}
 \begin{itemize}
 	\item \textbf{The GPU suits NLM}: heavy, regular, independent work per pixel. The whole pipeline reaches $\approx$15\,ps
-	      per pixel and search offset (the first kernel: 52\,ps), which is 143--149\,Mpx/s, \textbf{edge detection is the
-	      opposite}. Cheap per pixel, with decoding and hysteresis (an irregular connectivity problem) dominating, hence
+	      per pixel and search offset (the first kernel: 52\,ps), which is 143--149\,Mpx/s. \textbf{Edge detection is the
+	      opposite}: cheap per pixel, with decoding and hysteresis (an irregular connectivity problem) dominating, hence
 	      only 2.9--5.7$\times$. The copies that are 2\% of the NLM GPU time were 27--42\% of the Canny GPU time before the streams.
 	\item \textbf{Efficiency is bounded by the hardware}: 80\% on 8 cores and 40\% on 16 threads. NLM already keeps each core
 	      busy, so hyperthreading adds nothing, unlike the memory-bound edge detection (14--22\%).
@@ -423,7 +423,7 @@ artifacts are not noise and a denoiser cannot repair them. The 500-image samples
 
 \section{Conclusions}
 \texttt{imgfilter} denoises and edge-detects batches of images on the CPU and the GPU with identical results, and needs no tuning.
-Bands sized for the L2 cache and drawn from one pool make the CPU version scale as far as the eight cores allow (6.4--6.5$\times$).
+Bands of 16--32 rows drawn from one pool make the CPU version scale as far as the eight cores allow (6.4--6.5$\times$).
 A profile-driven tile kernel and a two-slot stream pipeline make the GPU \textbf{20--21$\times$ faster than the 16-thread CPU} for
 denoising (128--139$\times$ over one thread). The automatic noise estimate and strength raise the PSNR by 4.5--9.2\,dB and the edge
 F1 on real CT noise from 0.25 to 0.75.
@@ -446,7 +446,7 @@ with a tolerance based reference. Multi-GPU batches.
 \bibitem{mahmoudi05} M. Mahmoudi, G. Sapiro, Fast image and video denoising via nonlocal means of similar neighborhoods, \emph{IEEE Signal Processing Letters} 12(12), 2005.
 \bibitem{coupe08} P. Coup\'e et al., An optimized blockwise nonlocal means denoising filter for 3-D MR images, \emph{IEEE TMI} 27(4), 2008.
 \bibitem{kermany18} D. S. Kermany et al., Identifying medical diagnoses and treatable diseases by image-based deep learning, \emph{Cell} 172(5), 2018.
-\bibitem{kagglecxr} Kaggle dataset \texttt{muhammadrehan00/chest-xray-dataset},\\ \url{https://www.kaggle.com/datasets/muhammadrehan00/chest-xray-dataset}.
+\bibitem{kagglecxr} Kaggle dataset \href{https://www.kaggle.com/datasets/muhammadrehan00/chest-xray-dataset}{\texttt{muhammadrehan00/chest-xray-dataset}}.
 \bibitem{mccollough17} C. H. McCollough et al., Low-dose CT for the detection and classification of metastatic liver lesions: results of the 2016 Low Dose CT Grand Challenge, \emph{Medical Physics} 44(10), 2017.
 \bibitem{kiss23} M. B. Kiss et al., 2DeteCT -- a large 2D expandable, trainable, experimental computed tomography dataset for machine learning, \emph{Scientific Data} 10, 2023.
 \end{thebibliography}
